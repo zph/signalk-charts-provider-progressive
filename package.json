@@ -1,0 +1,40 @@
+{
+  "name": "signalk-charts-provider-progressive",
+  "version": "0.3.5",
+  "description": "Local-first progressive NOAA vector chart provider for Signal K",
+  "license": "MIT",
+  "main": "index.js",
+  "type": "commonjs",
+  "files": [
+    "index.js",
+    "chart_baker.py",
+    "public",
+    "progressive_provider.py",
+    "progressive_queue.py"
+  ],
+  "scripts": {
+    "test": "node --test test_plugin.js",
+    "test:python": "python3 -m unittest -v test_progressive_queue.py test_progressive_provider.py",
+    "verify": "npm test && npm run test:python && node --check index.js && uv run chart_baker.py --self-test"
+  },
+  "engines": {
+    "node": ">=22.5"
+  },
+  "keywords": [
+    "signalk-node-server-plugin",
+    "signalk-webapp",
+    "signalk-category-chart-plotter",
+    "charts",
+    "noaa",
+    "s-57"
+  ],
+  "signalk-plugin-enabled-by-default": true,
+  "signalk": {
+    "displayName": "Charts Provider Progressive",
+    "webapp": {
+      "name": "Charts Provider Progressive",
+      "description": "Build and publish local-first progressive NOAA vector charts",
+      "location": "/plugins/signalk-charts-provider-progressive/ui"
+    }
+  }
+}

@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Charts Provider Progressive</title>
+  </head>
+  <body>
+    <p id="loading">Loading Charts Provider Progressive...</p>
+    <script>
+      (async () => {
+        const loading = document.querySelector('#loading');
+        try {
+          const response = await fetch('/plugins/signalk-charts-provider-progressive/ui', {
+            credentials: 'same-origin'
+          });
+          if (!response.ok) {
+            throw new Error(`The chart provider returned HTTP ${response.status}.`);
+          }
+          const html = await response.text();
+          const configured = html.replace(
+            '<head>',
+            "<head><script>globalThis.CHART_PROVIDER_API_BASE='/plugins/signalk-charts-provider-progressive';<\/script>"
+          );
+          document.open();
+          document.write(configured);
+          document.close();
+        } catch (error) {
+          loading.textContent = error instanceof Error ? error.message : String(error);
+        }
+      })();
+    </script>
+  </body>
+</html>
