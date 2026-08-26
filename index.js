@@ -996,6 +996,9 @@ function spawnLocalBackend(app, port, debug, reportError) {
 
 function backendEnvironment() {
   const environment = { ...process.env, PYTHONUNBUFFERED: '1' };
+  delete environment.LISTEN_FDS;
+  delete environment.LISTEN_FDNAMES;
+  delete environment.LISTEN_PID;
   if (
     process.platform === 'linux' &&
     !environment.XDG_RUNTIME_DIR &&

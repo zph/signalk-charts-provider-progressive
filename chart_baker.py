@@ -47,7 +47,7 @@ from pydantic import BaseModel, Field, field_validator
 from progressive_queue import PriorityClass, ProgressiveJob, ProgressiveQueue
 from progressive_provider import ArtifactNotFound, ArtifactRegistry, InvalidArtifact, TileResponse
 
-APP_VERSION = "0.3.6"
+APP_VERSION = "0.3.7"
 NOAA_CATALOG_URL = "https://www.charts.noaa.gov/InteractiveCatalog/data/enc.geojson"
 NOAA_ENC_BASE_URL = "https://charts.noaa.gov/ENCs"
 TOOLBOX_IMAGE = "ghcr.io/dirkwa/signalk-charts-provider-simple/charts-toolbox:1.1.0"
@@ -153,6 +153,13 @@ def safe_stem(value: str, fallback: str = "chart-set") -> str:
 def detect_runtime(preferred: str = "auto") -> str | None:
     choices = [preferred] if preferred != "auto" else ["docker", "podman"]
     return next((choice for choice in choices if shutil.which(choice)), None)
+
+
+def container_subprocess_environment(source: dict[str, str] | None = None) -> dict[str, str]:
+    environment = dict(os.environ if source is None else source)
+    for name in ("LISTEN_FDS", "LISTEN_FDNAMES", "LISTEN_PID"):
+        environment.pop(name, None)
+    return environment
 
 
 def mercator_coord(x: float, y: float) -> tuple[float, float]:
@@ -718,7 +725,14 @@ class JobManager:
         for attempt in range(1, attempts + 1):
             self.append(job, f"Starting {label}" if attempt == 1 else f"Retrying {label} ({attempt}/{attempts})")
             recent: list[str] = []
-            process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+            process = subprocess.Popen(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+                env=container_subprocess_environment(),
+            )
             with job.process_lock:
                 job.processes.append(process)
             try:
@@ -1679,6 +1693,14 @@ def self_test() -> int:
         manager.runtime = "docker"
         docker_command = manager._container_base("test", [(temp, "/work", False)])
         assert "--userns=keep-id" not in docker_command
+        assert container_subprocess_environment(
+            {
+                "HOME": "/home/signalk",
+                "LISTEN_FDS": "1",
+                "LISTEN_FDNAMES": "signalk.socket",
+                "LISTEN_PID": "123",
+            }
+        ) == {"HOME": "/home/signalk"}
         assert conservative_depth_meters(12.192) == 12.192
         assert conservative_depth_meters(12.3) == 12.192
         assert conservative_depth_meters(16.4) == 16.1544

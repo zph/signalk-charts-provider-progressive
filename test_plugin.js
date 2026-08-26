@@ -24,13 +24,32 @@ const SAMPLE_CHART = {
 
 test('configuration is loopback-only and strictly validated', () => {
   const previousRuntimeDirectory = process.env.XDG_RUNTIME_DIR;
+  const previousSocketEnvironment = {
+    LISTEN_FDS: process.env.LISTEN_FDS,
+    LISTEN_FDNAMES: process.env.LISTEN_FDNAMES,
+    LISTEN_PID: process.env.LISTEN_PID
+  };
   process.env.XDG_RUNTIME_DIR = '/run/user/test';
-  assert.equal(bridge.backendEnvironment().XDG_RUNTIME_DIR, '/run/user/test');
-  assert.equal(bridge.backendEnvironment().PYTHONUNBUFFERED, '1');
+  process.env.LISTEN_FDS = '1';
+  process.env.LISTEN_FDNAMES = 'signalk.socket';
+  process.env.LISTEN_PID = '123';
+  const childEnvironment = bridge.backendEnvironment();
+  assert.equal(childEnvironment.XDG_RUNTIME_DIR, '/run/user/test');
+  assert.equal(childEnvironment.PYTHONUNBUFFERED, '1');
+  assert.equal(childEnvironment.LISTEN_FDS, undefined);
+  assert.equal(childEnvironment.LISTEN_FDNAMES, undefined);
+  assert.equal(childEnvironment.LISTEN_PID, undefined);
   if (previousRuntimeDirectory === undefined) {
     delete process.env.XDG_RUNTIME_DIR;
   } else {
     process.env.XDG_RUNTIME_DIR = previousRuntimeDirectory;
+  }
+  for (const [name, value] of Object.entries(previousSocketEnvironment)) {
+    if (value === undefined) {
+      delete process.env[name];
+    } else {
+      process.env[name] = value;
+    }
   }
   assert.deepEqual(bridge.normalizeConfig({}), {
     startLocalBackend: true,
