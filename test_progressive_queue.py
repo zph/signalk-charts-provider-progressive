@@ -72,6 +72,18 @@ class ProgressiveQueueTest(unittest.TestCase):
         self.assertEqual(("DEPARE",), duplicate.layers)
         self.assertEqual("safety", duplicate.profile)
 
+    def test_resubmitting_a_failed_job_requeues_it(self):
+        original = self.queue.enqueue_cell("noaa", "US5CA52M")
+        leased = self.queue.lease_next("pi-local")
+        self.queue.fail(original.id, leased.lease.token, "container failed", retry=False)
+
+        retried = self.queue.enqueue_cell("noaa", "US5CA52M")
+
+        self.assertEqual(original.id, retried.id)
+        self.assertEqual("queued", retried.status)
+        self.assertEqual(0, retried.attempts)
+        self.assertIsNone(retried.error)
+
     def test_orders_viewport_then_adjacent_zooms_then_rings(self):
         ring_two = self.queue.enqueue_cell(
             "noaa", "ring-2", priority_class=PriorityClass.SURROUNDING_RING, ring=2

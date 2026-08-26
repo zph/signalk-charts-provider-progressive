@@ -47,7 +47,7 @@ from pydantic import BaseModel, Field, field_validator
 from progressive_queue import PriorityClass, ProgressiveJob, ProgressiveQueue
 from progressive_provider import ArtifactNotFound, ArtifactRegistry, InvalidArtifact, TileResponse
 
-APP_VERSION = "0.3.5"
+APP_VERSION = "0.3.6"
 NOAA_CATALOG_URL = "https://www.charts.noaa.gov/InteractiveCatalog/data/enc.geojson"
 NOAA_ENC_BASE_URL = "https://charts.noaa.gov/ENCs"
 TOOLBOX_IMAGE = "ghcr.io/dirkwa/signalk-charts-provider-simple/charts-toolbox:1.1.0"
@@ -701,7 +701,10 @@ class JobManager:
             raise RuntimeError("No container runtime available")
         mount_points = {container for _, container, _ in mounts}
         workdir = "/work" if "/work" in mount_points else "/data" if "/data" in mount_points else "/"
-        command = [self.runtime, "run", "--rm", "--name", name, "--network", "none", "--workdir", workdir]
+        command = [self.runtime, "run", "--rm"]
+        if self.runtime == "podman":
+            command += ["--replace", "--userns=keep-id"]
+        command += ["--name", name, "--network", "none", "--workdir", workdir]
         if hasattr(os, "getuid"):
             command += ["--user", f"{os.getuid()}:{os.getgid()}"]
         for host, container, readonly in mounts:
@@ -711,25 +714,42 @@ class JobManager:
         return command
 
     def _exec(self, job: Job, command: list[str], label: str) -> None:
-        self.append(job, f"Starting {label}")
-        process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
-        with job.process_lock:
-            job.processes.append(process)
-        try:
-            assert process.stdout is not None
-            for line in process.stdout:
-                self.append(job, line)
-                if job.cancel.is_set():
-                    process.terminate()
-                    break
-            code = process.wait()
-        finally:
+        attempts = 3 if self.runtime == "podman" else 1
+        for attempt in range(1, attempts + 1):
+            self.append(job, f"Starting {label}" if attempt == 1 else f"Retrying {label} ({attempt}/{attempts})")
+            recent: list[str] = []
+            process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
             with job.process_lock:
-                if process in job.processes:
-                    job.processes.remove(process)
-        if job.cancel.is_set():
-            raise RuntimeError("cancelled")
-        if code != 0:
+                job.processes.append(process)
+            try:
+                assert process.stdout is not None
+                for line in process.stdout:
+                    recent.append(line)
+                    del recent[:-30]
+                    self.append(job, line)
+                    if job.cancel.is_set():
+                        process.terminate()
+                        break
+                code = process.wait()
+            finally:
+                with job.process_lock:
+                    if process in job.processes:
+                        job.processes.remove(process)
+            if job.cancel.is_set():
+                raise RuntimeError("cancelled")
+            if code == 0:
+                return
+            transient_storage_error = code in (125, 126) and any(
+                marker in "".join(recent).lower()
+                for marker in (
+                    "disk i/o error: bad file descriptor",
+                    "database is locked",
+                )
+            )
+            if transient_storage_error and attempt < attempts:
+                self.append(job, "Podman storage was temporarily unavailable; retrying")
+                time.sleep(attempt)
+                continue
             raise RuntimeError(f"{label} exited with status {code}")
 
     def _build_enc(
@@ -970,6 +990,7 @@ class ProgressiveController:
                     "profile": request.profile,
                     "layers": layers,
                     "profile_version": 1,
+                    "pipeline_version": APP_VERSION,
                     "toolbox": TOOLBOX_IMAGE,
                 },
                 sort_keys=True,
@@ -1288,9 +1309,9 @@ export_one() {
       layer_clip=(-spat "$west" "$south" "$east" "$north" -clipsrc "$west" "$south" "$east" "$north")
     fi
     if [[ "$layer" == "SOUNDG" ]]; then
-      ogr2ogr -f GeoJSONSeq -skipfailures -mapFieldType DateTime=String -lco COORDINATE_PRECISION=6 -oo LIST_AS_STRING=YES -oo SPLIT_MULTIPOINT=YES -oo ADD_SOUNDG_DEPTH=YES "${layer_clip[@]}" "$output" "$enc" "$layer" || true
+      ogr2ogr -f GeoJSONSeq -skipfailures -mapFieldType DateTime=String -lco COORDINATE_PRECISION=6 -oo LIST_AS_STRING=YES -oo SPLIT_MULTIPOINT=YES -oo ADD_SOUNDG_DEPTH=YES "${layer_clip[@]}" "$output" "$enc" "$layer"
     else
-      ogr2ogr -f GeoJSONSeq -skipfailures -mapFieldType DateTime=String -lco COORDINATE_PRECISION=6 -oo LIST_AS_STRING=YES "${layer_clip[@]}" "$output" "$enc" "$layer" || true
+      ogr2ogr -f GeoJSONSeq -skipfailures -mapFieldType DateTime=String -lco COORDINATE_PRECISION=6 -oo LIST_AS_STRING=YES "${layer_clip[@]}" "$output" "$enc" "$layer"
     fi
     [[ -s "$output" ]] || rm -f "$output"
   done
@@ -1650,6 +1671,14 @@ def self_test() -> int:
         assert planned["scheduled"][-1]["metadata"]["clip_bounds"] is None
         assert planned["scheduled"][-1]["metadata"]["refine"] is True
         assert "-clipsrc" in EXPORT_SCRIPT
+        assert "|| true" not in EXPORT_SCRIPT
+        manager.runtime = "podman"
+        podman_command = manager._container_base("test", [(temp, "/work", False)])
+        assert "--userns=keep-id" in podman_command
+        assert "--replace" in podman_command
+        manager.runtime = "docker"
+        docker_command = manager._container_base("test", [(temp, "/work", False)])
+        assert "--userns=keep-id" not in docker_command
         assert conservative_depth_meters(12.192) == 12.192
         assert conservative_depth_meters(12.3) == 12.192
         assert conservative_depth_meters(16.4) == 16.1544

@@ -273,6 +273,11 @@ class ProgressiveQueue:
             if existing_id is not None:
                 existing = self._jobs[existing_id]
                 changed = False
+                if existing.status == "failed":
+                    existing.status = "queued"
+                    existing.error = None
+                    existing.attempts = 0
+                    changed = True
                 if priority < _spatial_priority(existing):
                     existing.priority_class, existing.zoom_distance, existing.ring = priority
                     changed = True
