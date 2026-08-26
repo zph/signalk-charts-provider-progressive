@@ -94,7 +94,7 @@ The queue sorts first by preview versus refinement, then by spatial priority, zo
 
 The default UI uses one conversion worker so Signal K remains responsive on a Raspberry Pi. GDAL export, Tippecanoe, and tile-join share that configured local CPU budget.
 
-Downloaded ENC ZIPs are content checked and retained. Completed chart generations survive restarts. Local-worker leases are reclaimed immediately after a provider restart, while expired remote-worker leases return to the queue automatically.
+Downloaded ENC ZIPs are content checked and retained. Completed chart generations survive restarts. Graceful shutdown returns active local work to the queue without consuming a retry. Any remaining local-worker lease is reclaimed immediately after a provider restart, while expired remote-worker leases return to the queue automatically.
 
 ## Managing chart sets
 

@@ -48,7 +48,7 @@ from pydantic import BaseModel, Field, field_validator
 from progressive_queue import PriorityClass, ProgressiveJob, ProgressiveQueue
 from progressive_provider import ArtifactNotFound, ArtifactRegistry, InvalidArtifact, TileResponse
 
-APP_VERSION = "0.3.9"
+APP_VERSION = "0.3.10"
 NOAA_CATALOG_URL = "https://www.charts.noaa.gov/InteractiveCatalog/data/enc.geojson"
 NOAA_ENC_BASE_URL = "https://charts.noaa.gov/ENCs"
 TOOLBOX_IMAGE = "ghcr.io/dirkwa/signalk-charts-provider-simple/charts-toolbox:1.1.0"
@@ -1281,9 +1281,6 @@ class ProgressiveController:
             if job.metadata.get("chart_id") == chart_id
             and job.status in {"failed", "cancelled"}
         ]
-        self._cancel_active_builds(chart_id)
-        if not self._wait_until_inactive(chart_id):
-            raise RuntimeError("Chart conversion is still stopping; retry in a few seconds")
         for job in retryable:
             shutil.rmtree(self.data_dir / "tasks" / job.id, ignore_errors=True)
         retried = self.queue.retry_chart(chart_id)
@@ -1437,7 +1434,12 @@ class ProgressiveController:
                 self.queue.complete(work.id, token)
             except Exception as error:
                 try:
-                    self.queue.fail(work.id, token, str(error), retry=work.attempts < 2)
+                    if self.stop_event.is_set():
+                        self.queue.release(work.id, token)
+                    else:
+                        self.queue.fail(
+                            work.id, token, str(error), retry=work.attempts < 2
+                        )
                 except Exception:
                     pass
             finally:

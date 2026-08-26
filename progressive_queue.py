@@ -411,6 +411,18 @@ class ProgressiveQueue:
             self._save_locked()
             return job
 
+    def release(self, job_id: str, lease_token: str) -> ProgressiveJob:
+        """Return leased work to the queue without counting a graceful shutdown as failure."""
+
+        with self._lock:
+            job = self._leased_job(job_id, lease_token)
+            job.status = "queued"
+            job.lease = None
+            job.error = None
+            job.updated_at = self._timestamp()
+            self._save_locked()
+            return job
+
     def fail(
         self,
         job_id: str,
