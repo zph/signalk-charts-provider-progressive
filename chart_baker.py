@@ -48,7 +48,7 @@ from pydantic import BaseModel, Field, field_validator
 from progressive_queue import PriorityClass, ProgressiveJob, ProgressiveQueue
 from progressive_provider import ArtifactNotFound, ArtifactRegistry, InvalidArtifact, TileResponse
 
-APP_VERSION = "0.3.10"
+APP_VERSION = "0.3.11"
 NOAA_CATALOG_URL = "https://www.charts.noaa.gov/InteractiveCatalog/data/enc.geojson"
 NOAA_ENC_BASE_URL = "https://charts.noaa.gov/ENCs"
 TOOLBOX_IMAGE = "ghcr.io/dirkwa/signalk-charts-provider-simple/charts-toolbox:1.1.0"
@@ -70,6 +70,45 @@ BAND_ZOOMS: dict[int, tuple[int, int]] = {
     8: (13, 16),
     9: (15, 18),
 }
+
+
+def enc_band_zoom_ranges(
+    band_keys: Iterable[str], requested_min: int, requested_max: int
+) -> dict[str, tuple[int, int]]:
+    """Map available ENC bands onto every requested zoom without leaving edge gaps."""
+    available: list[tuple[str, int, int, int]] = []
+    for key in sorted(set(band_keys)):
+        band = int(key[1:]) if key[1:].isdigit() else 0
+        native_min, native_max = BAND_ZOOMS.get(
+            band, (requested_min, requested_max)
+        )
+        available.append((key, band, native_min, native_max))
+    if not available:
+        return {}
+
+    planned: dict[str, tuple[int, int]] = {}
+    for key, _band, native_min, native_max in available:
+        min_zoom = max(requested_min, native_min)
+        max_zoom = min(requested_max, native_max)
+        if min_zoom <= max_zoom:
+            planned[key] = (min_zoom, max_zoom)
+
+    lowest = min(available, key=lambda item: (item[2], item[1], item[0]))
+    if requested_min < lowest[2]:
+        existing = planned.get(lowest[0])
+        planned[lowest[0]] = (
+            requested_min,
+            existing[1] if existing is not None else requested_max,
+        )
+
+    highest = max(available, key=lambda item: (item[3], item[1], item[0]))
+    if requested_max > highest[3]:
+        existing = planned.get(highest[0])
+        planned[highest[0]] = (
+            existing[0] if existing is not None else requested_min,
+            requested_max,
+        )
+    return planned
 
 SAFE_NAME = re.compile(r"[^A-Za-z0-9._-]+")
 SAFE_CHART_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
@@ -857,17 +896,26 @@ class JobManager:
             f"Conservatively rounded {rounded_depths} depth values above 40 ft",
         )
         band_keys = sorted(set(path.name.split("__", 1)[0] for path in exported))
-        band_workers = min(len(band_keys), max(1, parallelism // 2))
+        band_zoom_ranges = enc_band_zoom_ranges(
+            band_keys, int(job.config["min_zoom"]), int(job.config["max_zoom"])
+        )
+        if not band_zoom_ranges:
+            raise RuntimeError("GDAL produced no usable S-57 scale bands")
+        band_workers = min(len(band_zoom_ranges), max(1, parallelism // 2))
         threads_per_band = max(1, parallelism // band_workers)
 
-        def tile_band(key: str) -> Path | None:
+        def tile_band(key: str) -> Path:
             band_value = int(key[1:]) if key[1:].isdigit() else 0
-            native_min, native_max = BAND_ZOOMS.get(band_value, (job.config["min_zoom"], job.config["max_zoom"]))
-            min_zoom = max(int(job.config["min_zoom"]), native_min)
-            max_zoom = min(int(job.config["max_zoom"]), native_max)
-            if min_zoom > max_zoom:
-                self.append(job, f"Skipping ENC band {band_value}: outside requested zooms")
-                return None
+            min_zoom, max_zoom = band_zoom_ranges[key]
+            native_min, native_max = BAND_ZOOMS.get(
+                band_value, (min_zoom, max_zoom)
+            )
+            if min_zoom < native_min or max_zoom > native_max:
+                self.append(
+                    job,
+                    f"Extending ENC band {band_value} from native z{native_min}-{native_max} "
+                    f"to requested z{min_zoom}-{max_zoom}",
+                )
             script = work / f"tippecanoe-{key}.sh"
             script.write_text(
                 TIPPECANOE_PREVIEW_SCRIPT if profile == "preview" else TIPPECANOE_SCRIPT,
@@ -881,11 +929,9 @@ class JobManager:
             self._exec(job, command, f"tiling ENC {key}")
             return bands / f"{key}.mbtiles"
 
-        self.update(job, f"Building {len(band_keys)} scale bands", 0.58)
+        self.update(job, f"Building {len(band_zoom_ranges)} scale bands", 0.58)
         with concurrent.futures.ThreadPoolExecutor(max_workers=band_workers) as pool:
-            band_files = [path for path in pool.map(tile_band, band_keys) if path is not None]
-        if not band_files:
-            raise RuntimeError("Requested zooms exclude every available ENC band")
+            band_files = list(pool.map(tile_band, band_zoom_ranges))
         mbtiles = work / f"{output_stem}.mbtiles"
         join_script = work / "join.sh"
         join_script.write_text(JOIN_SCRIPT, encoding="utf-8")
@@ -2072,6 +2118,15 @@ def self_test() -> int:
         assert conservative_depth_meters(12.192) == 12.192
         assert conservative_depth_meters(12.3) == 12.192
         assert conservative_depth_meters(16.4) == 16.1544
+        assert enc_band_zoom_ranges(["B03", "B04", "B05"], 4, 16) == {
+            "B03": (4, 12),
+            "B04": (10, 14),
+            "B05": (12, 16),
+        }
+        assert enc_band_zoom_ranges(["B03", "B04", "B05"], 6, 6) == {
+            "B03": (6, 6)
+        }
+        assert enc_band_zoom_ranges(["B03", "B05"], 18, 18) == {"B05": (18, 18)}
         depth_stream = temp / "depths.geojsonseq"
         depth_stream.write_text(
             '\x1e{"type":"Feature","properties":{"DEPTH":12.3,"VALSOU":16.4,"OTHER":99}}\n',
