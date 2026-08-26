@@ -82,17 +82,32 @@ The plugin starts the bundled backend by default. Its settings allow changing th
 
 ## Priority and local resource use
 
-The persistent queue orders work as:
+When a chart set is submitted, the provider captures the map viewport and requested zoom range. It then creates persistent work packets in this order:
 
-1. Current viewport and zoom
-2. Other zooms for the same viewport
-3. Surrounding viewport rings
-4. Remaining selected coverage
-5. Refined conversion
+1. The current viewport at the current zoom.
+2. The same viewport at the other requested zoom levels, ordered by zoom distance.
+3. A one-viewport-wide surrounding ring at the requested zoom levels.
+4. A preview of the remaining selected coverage.
+5. Refined conversion of those packets in the same spatial order.
 
-Preview work across all regions completes before refinement begins. The default UI uses one conversion worker so Signal K remains responsive on a Raspberry Pi. GDAL export, Tippecanoe, and tile-join share that configured local CPU budget.
+The queue sorts first by preview versus refinement, then by spatial priority, zoom distance, ring number, and submission sequence. Preview work across all chart sets therefore completes before refinement begins. This is proactive local pre-rendering based on the viewport at submission time. It does not yet continuously follow the boat or reprioritize from every pan in Freeboard or Binnacle. That can be added later without changing the persisted queue format.
+
+The default UI uses one conversion worker so Signal K remains responsive on a Raspberry Pi. GDAL export, Tippecanoe, and tile-join share that configured local CPU budget.
 
 Downloaded ENC ZIPs are content checked and retained. Completed chart generations survive restarts. Expired local leases return to the queue automatically.
+
+## Managing chart sets
+
+Each progressive chart set has controls in the Build queue:
+
+- **Pause** prevents the next packet from starting. It lets the currently active packet finish.
+- **Resume** allows queued packets to start again.
+- **Stop build** cancels queued packets and interrupts the active download, extraction, or conversion. The most recently published chart remains available.
+- **Retry failed** requeues failed and cancelled packets at their original priority.
+- **Clear history** removes failed and cancelled task records and their scratch directories. It does not remove published charts or downloaded NOAA source cells.
+- **Delete chart** stops its work, removes its queue history, and removes all published generations. It can optionally remove downloaded NOAA source editions that no other chart set references.
+
+Deletion requires explicit confirmation of the chart identifier. Shared NOAA source data is retained by default so recreating a chart does not require another download.
 
 ## Layer profiles
 

@@ -331,6 +331,52 @@ function pluginConstructor(app) {
       router.post('/api/progressive/noaa', async (req, res) => {
         await proxyJsonPost(req, res, config.backendPort, '/api/progressive/noaa');
       });
+      for (const action of ['pause', 'resume', 'cancel', 'retry']) {
+        router.post(`/api/progressive/charts/:chartId/${action}`, async (req, res) => {
+          const chartId = String(req.params?.chartId ?? '');
+          if (!ID_PATTERN.test(chartId)) {
+            sendJsonError(res, 400, 'Invalid chart identifier');
+            return;
+          }
+          await proxyJsonPost(
+            req,
+            res,
+            config.backendPort,
+            `/api/progressive/charts/${encodeURIComponent(chartId)}/${action}`,
+            true
+          );
+        });
+      }
+      router.post('/api/progressive/charts/:chartId/history/clear', async (req, res) => {
+        const chartId = String(req.params?.chartId ?? '');
+        if (!ID_PATTERN.test(chartId)) {
+          sendJsonError(res, 400, 'Invalid chart identifier');
+          return;
+        }
+        await proxyJsonPost(
+          req,
+          res,
+          config.backendPort,
+          `/api/progressive/charts/${encodeURIComponent(chartId)}/history/clear`,
+          true
+        );
+      });
+      router.post('/api/progressive/charts/:chartId/delete', async (req, res) => {
+        const chartId = String(req.params?.chartId ?? '');
+        if (!ID_PATTERN.test(chartId)) {
+          sendJsonError(res, 400, 'Invalid chart identifier');
+          return;
+        }
+        await proxyJsonPost(
+          req,
+          res,
+          config.backendPort,
+          `/api/progressive/charts/${encodeURIComponent(chartId)}/delete`
+        );
+        if (res.statusCode >= 200 && res.statusCode < 300) {
+          await refreshCharts(true).catch(() => {});
+        }
+      });
       router.post('/api/jobs/url', async (req, res) => {
         await proxyJsonPost(req, res, config.backendPort, '/api/jobs/url');
       });

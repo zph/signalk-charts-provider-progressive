@@ -204,6 +204,142 @@ class ProgressiveQueueTest(unittest.TestCase):
         packet = self.queue.enqueue(JobKey.for_packet("packet", "profile", "1"))
         self.assertNotEqual(cell.id, packet.id)
 
+    def test_paused_chart_is_skipped_and_pause_survives_reload(self):
+        paused = self.queue.enqueue_cell(
+            "noaa", "paused", metadata={"chart_id": "chart-a"}
+        )
+        available = self.queue.enqueue_cell(
+            "noaa", "available", metadata={"chart_id": "chart-b"}
+        )
+        self.assertTrue(self.queue.pause_chart("chart-a"))
+
+        reloaded = ProgressiveQueue(self.path, lease_seconds=30, clock=self.clock)
+        self.assertTrue(reloaded.is_chart_paused("chart-a"))
+        self.assertEqual(available.id, reloaded.lease_next("pi-local").id)
+        self.assertIsNone(reloaded.lease_next("pi-local"))
+
+        self.assertTrue(reloaded.resume_chart("chart-a"))
+        self.assertEqual(paused.id, reloaded.lease_next("pi-local").id)
+
+    def test_pausing_preserves_an_existing_lease(self):
+        job = self.queue.enqueue_cell(
+            "noaa", "active", metadata={"chart_id": "chart-a", "refine": False}
+        )
+        leased = self.queue.lease_next("pi-local")
+        token = leased.lease.token
+
+        self.queue.pause_chart("chart-a")
+        reloaded = ProgressiveQueue(self.path, lease_seconds=30, clock=self.clock)
+        completed = reloaded.complete(job.id, token)
+
+        self.assertEqual("complete", completed.status)
+        self.assertTrue(reloaded.is_chart_paused("chart-a"))
+
+    def test_cancel_invalidates_lease_and_never_auto_requeues(self):
+        job = self.queue.enqueue_cell(
+            "noaa", "leased", metadata={"chart_id": "chart-a"}
+        )
+        leased = self.queue.lease_next("pi-local")
+        token = leased.lease.token
+
+        cancelled = self.queue.cancel_chart("chart-a")
+        self.clock.advance(31)
+        reloaded = ProgressiveQueue(self.path, lease_seconds=30, clock=self.clock)
+
+        self.assertEqual([job.id], [item.id for item in cancelled])
+        self.assertEqual("cancelled", reloaded.get(job.id).status)
+        self.assertEqual([], reloaded.requeue_expired())
+        self.assertIsNone(reloaded.lease_next("pi-local"))
+        with self.assertRaises(LeaseConflict):
+            reloaded.complete(job.id, token)
+        duplicate = reloaded.enqueue_cell(
+            "noaa", "leased", metadata={"chart_id": "chart-a"}
+        )
+        self.assertEqual("cancelled", duplicate.status)
+
+    def test_cancel_retry_and_clear_are_chart_scoped(self):
+        first = self.queue.enqueue_cell(
+            "noaa",
+            "first",
+            priority_class=PriorityClass.SURROUNDING_RING,
+            ring=2,
+            metadata={"chart_id": "chart-a"},
+        )
+        second = self.queue.enqueue_cell(
+            "noaa",
+            "second",
+            priority_class=PriorityClass.VIEWPORT,
+            metadata={"chart_id": "chart-a"},
+        )
+        other = self.queue.enqueue_cell(
+            "noaa", "other", metadata={"chart_id": "chart-b"}
+        )
+        self.queue.cancel_chart("chart-a")
+
+        retried = self.queue.retry_chart("chart-a")
+
+        self.assertEqual([second.id, first.id], [item.id for item in retried])
+        self.assertEqual("queued", self.queue.get(first.id).status)
+        self.assertEqual("queued", self.queue.get(second.id).status)
+        self.assertEqual("queued", self.queue.get(other.id).status)
+        self.queue.cancel_chart("chart-a")
+        removed = self.queue.clear_chart_history("chart-a")
+        self.assertEqual({first.id, second.id}, set(removed))
+        self.assertIsNone(self.queue.get(first.id))
+        self.assertIsNotNone(self.queue.get(other.id))
+
+    def test_clear_history_removes_failed_and_cancelled_only(self):
+        failed = self.queue.enqueue_cell(
+            "noaa", "failed", metadata={"chart_id": "chart-a"}
+        )
+        leased = self.queue.lease_next("pi-local")
+        self.queue.fail(failed.id, leased.lease.token, "failed", retry=False)
+        cancelled = self.queue.enqueue_cell(
+            "noaa", "cancelled", metadata={"chart_id": "chart-b"}
+        )
+        self.queue.cancel_chart("chart-b")
+        queued = self.queue.enqueue_cell(
+            "noaa", "queued", metadata={"chart_id": "chart-c"}
+        )
+
+        removed = self.queue.clear_history()
+
+        self.assertEqual({failed.id, cancelled.id}, set(removed))
+        self.assertIsNotNone(self.queue.get(queued.id))
+
+    def test_retry_chart_explicitly_requeues_failed_work(self):
+        failed = self.queue.enqueue_cell(
+            "noaa", "failed", metadata={"chart_id": "chart-a"}
+        )
+        leased = self.queue.lease_next("pi-local")
+        self.queue.fail(failed.id, leased.lease.token, "failed", retry=False)
+
+        retried = self.queue.retry_chart("chart-a")
+
+        self.assertEqual([failed.id], [job.id for job in retried])
+        self.assertEqual("queued", retried[0].status)
+        self.assertEqual(0, retried[0].attempts)
+        self.assertIsNone(retried[0].error)
+
+    def test_remove_chart_deletes_all_jobs_and_its_pause(self):
+        first = self.queue.enqueue_cell(
+            "noaa", "first", metadata={"chart_id": "chart-a"}
+        )
+        second = self.queue.enqueue_cell(
+            "noaa", "second", metadata={"chart_id": "chart-a"}
+        )
+        other = self.queue.enqueue_cell(
+            "noaa", "other", metadata={"chart_id": "chart-b"}
+        )
+        self.queue.pause_chart("chart-a")
+
+        removed = self.queue.remove_chart("chart-a")
+        reloaded = ProgressiveQueue(self.path, lease_seconds=30, clock=self.clock)
+
+        self.assertEqual({first.id, second.id}, set(removed))
+        self.assertFalse(reloaded.is_chart_paused("chart-a"))
+        self.assertEqual([other.id], [job.id for job in reloaded.jobs()])
+
 
 if __name__ == "__main__":
     unittest.main()

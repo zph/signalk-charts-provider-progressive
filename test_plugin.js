@@ -128,6 +128,15 @@ test('plugin refreshes resources, emits deltas, and proxies bounded generation t
       sendJson(res, { cancelled: true }, 202);
       return;
     }
+    if (
+      req.method === 'POST' &&
+      req.url?.startsWith('/api/progressive/charts/noaa-sf-bay/')
+    ) {
+      const body = JSON.parse((await readRequest(req)).toString('utf8'));
+      managementRequests.push({ path: req.url, body });
+      sendJson(res, { chart_id: 'noaa-sf-bay' }, 202);
+      return;
+    }
     if (req.url === '/api/provider/charts') {
       sendJson(res, { charts: descriptors });
       return;
@@ -239,6 +248,45 @@ test('plugin refreshes resources, emits deltas, and proxies bounded generation t
     path: '/api/jobs/abc123/cancel',
     body: {}
   });
+
+  const pauseRoute = managementRouter.posts.find(
+    (route) => route.path === '/api/progressive/charts/:chartId/pause'
+  );
+  const pauseResponse = makeResponse();
+  await pauseRoute.handler(
+    { params: { chartId: 'noaa-sf-bay' }, headers: {}, body: undefined },
+    pauseResponse
+  );
+  assert.equal(pauseResponse.statusCode, 202);
+  assert.deepEqual(managementRequests.at(-1), {
+    path: '/api/progressive/charts/noaa-sf-bay/pause',
+    body: {}
+  });
+
+  const deleteRoute = managementRouter.posts.find(
+    (route) => route.path === '/api/progressive/charts/:chartId/delete'
+  );
+  const deleteResponse = makeResponse();
+  await deleteRoute.handler(
+    {
+      params: { chartId: 'noaa-sf-bay' },
+      headers: { 'content-type': 'application/json' },
+      body: { confirm_chart_id: 'noaa-sf-bay', purge_sources: false }
+    },
+    deleteResponse
+  );
+  assert.equal(deleteResponse.statusCode, 202);
+  assert.deepEqual(managementRequests.at(-1), {
+    path: '/api/progressive/charts/noaa-sf-bay/delete',
+    body: { confirm_chart_id: 'noaa-sf-bay', purge_sources: false }
+  });
+
+  const invalidChartResponse = makeResponse();
+  await pauseRoute.handler(
+    { params: { chartId: '../bad' }, headers: {}, body: undefined },
+    invalidChartResponse
+  );
+  assert.equal(invalidChartResponse.statusCode, 400);
 
   const tileRoute = apiRouter.gets.find((route) => route.path.includes(':generation'));
   const tileResponse = makeResponse();

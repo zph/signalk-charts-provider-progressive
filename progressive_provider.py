@@ -163,6 +163,7 @@ class ArtifactRegistry:
         layers: Optional[Sequence[str]] = None,
         name: Optional[str] = None,
         description: Optional[str] = None,
+        activate: bool = True,
     ) -> ArtifactGeneration:
         chart_id = _identifier(chart_id, "chart identifier")
         generation_id = _identifier(generation, "generation")
@@ -214,7 +215,8 @@ class ArtifactRegistry:
                 )
                 self._charts[chart_id] = chart
             chart.generations[generation_id] = artifact
-            chart.active_generation = generation_id
+            if activate:
+                chart.active_generation = generation_id
             self._save_locked()
             return artifact
 
@@ -226,6 +228,29 @@ class ArtifactRegistry:
     def charts(self) -> List[ChartRecord]:
         with self._lock:
             return [copy.deepcopy(self._charts[key]) for key in sorted(self._charts)]
+
+    def delete_chart(self, chart_id: str) -> Dict[str, int]:
+        chart_id = _identifier(chart_id, "chart identifier")
+        with self._lock:
+            chart = self._charts.pop(chart_id, None)
+            if chart is None:
+                return {"generations": 0, "bytes": 0}
+            self._save_locked()
+        removed_bytes = 0
+        for artifact in chart.generations.values():
+            candidate = (self.artifact_root / artifact.relative_path).resolve()
+            _require_within(candidate, self.artifact_root)
+            try:
+                removed_bytes += candidate.stat().st_size
+                candidate.unlink()
+            except FileNotFoundError:
+                pass
+        chart_directory = self.artifact_root / chart_id
+        try:
+            chart_directory.rmdir()
+        except (FileNotFoundError, OSError):
+            pass
+        return {"generations": len(chart.generations), "bytes": removed_bytes}
 
     def descriptor(
         self,

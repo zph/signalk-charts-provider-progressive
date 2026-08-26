@@ -119,6 +119,21 @@ class ArtifactRegistryTest(unittest.TestCase):
                 "noaa-west", "g1", replacement, phase="preview"
             )
 
+    def test_registers_generation_without_replacing_active_chart(self):
+        active = self.registry.register_mbtiles(
+            "noaa-west", "refined", self.preview, phase="refined"
+        )
+        later = self.root / "later.mbtiles"
+        create_mbtiles(later, phase_layer="LNDARE")
+
+        self.registry.register_mbtiles(
+            "noaa-west", "preview", later, phase="preview", activate=False
+        )
+
+        chart = self.registry.chart("noaa-west")
+        self.assertEqual(active.generation, chart.active_generation)
+        self.assertIn("preview", chart.generations)
+
     def test_rejects_invalid_metadata_and_selected_layers(self):
         with self.assertRaises(InvalidArtifact):
             self.registry.register_mbtiles(
@@ -172,6 +187,27 @@ class ArtifactRegistryTest(unittest.TestCase):
         )
         self.assertEqual("application/vnd.mapbox-vector-tile", tile.headers["Content-Type"])
         self.assertIsNone(read_xyz_tile(tile_path, 2, 1, 2))
+
+    def test_delete_chart_removes_registry_and_generation_files(self):
+        chart_dir = self.root / "noaa-west"
+        chart_dir.mkdir()
+        preview = chart_dir / "g1.mbtiles"
+        refined = chart_dir / "g2.mbtiles"
+        create_mbtiles(preview)
+        create_mbtiles(refined, phase_layer="LNDARE")
+        self.registry.register_mbtiles("noaa-west", "g1", preview, phase="preview")
+        self.registry.register_mbtiles("noaa-west", "g2", refined, phase="refined")
+        expected_bytes = preview.stat().st_size + refined.stat().st_size
+
+        removed = self.registry.delete_chart("noaa-west")
+
+        self.assertEqual({"generations": 2, "bytes": expected_bytes}, removed)
+        self.assertIsNone(self.registry.chart("noaa-west"))
+        self.assertFalse(preview.exists())
+        self.assertFalse(refined.exists())
+        self.assertFalse(chart_dir.exists())
+        self.assertEqual({"generations": 0, "bytes": 0}, self.registry.delete_chart("noaa-west"))
+        self.assertIsNone(ArtifactRegistry(self.state, self.root).chart("noaa-west"))
 
 
 if __name__ == "__main__":

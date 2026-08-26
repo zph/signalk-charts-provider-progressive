@@ -23,6 +23,7 @@ import json
 import math
 import os
 import re
+import signal
 import shlex
 import shutil
 import sqlite3
@@ -47,7 +48,7 @@ from pydantic import BaseModel, Field, field_validator
 from progressive_queue import PriorityClass, ProgressiveJob, ProgressiveQueue
 from progressive_provider import ArtifactNotFound, ArtifactRegistry, InvalidArtifact, TileResponse
 
-APP_VERSION = "0.3.7"
+APP_VERSION = "0.3.8"
 NOAA_CATALOG_URL = "https://www.charts.noaa.gov/InteractiveCatalog/data/enc.geojson"
 NOAA_ENC_BASE_URL = "https://charts.noaa.gov/ENCs"
 TOOLBOX_IMAGE = "ghcr.io/dirkwa/signalk-charts-provider-simple/charts-toolbox:1.1.0"
@@ -71,6 +72,7 @@ BAND_ZOOMS: dict[int, tuple[int, int]] = {
 }
 
 SAFE_NAME = re.compile(r"[^A-Za-z0-9._-]+")
+SAFE_CHART_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 SAFE_SSH_ALIAS = re.compile(r"^[A-Za-z0-9_.@-]+$")
 SUPPORTED_VECTOR = {".000", ".geojson", ".geojsonseq", ".geojsonl", ".json"}
 SUPPORTED_RASTER = {".kap", ".bsb", ".tif", ".tiff", ".vrt"}
@@ -445,6 +447,11 @@ class ProgressiveNoaaRequest(NoaaJobRequest):
         return normalized
 
 
+class ProgressiveDeleteRequest(BaseModel):
+    confirm_chart_id: str = Field(min_length=1, max_length=128)
+    purge_sources: bool = False
+
+
 class UrlJobRequest(BaseModel):
     name: str = Field(min_length=1, max_length=100)
     urls: list[str] = Field(min_length=1, max_length=50)
@@ -546,7 +553,28 @@ class JobManager:
             processes = list(job.processes)
         for process in processes:
             if process.poll() is None:
+                self._terminate_process(process)
+
+    @staticmethod
+    def _terminate_process(process: subprocess.Popen[str]) -> None:
+        if process.poll() is not None:
+            return
+        try:
+            if os.name == "posix":
+                os.killpg(process.pid, signal.SIGTERM)
+            else:
                 process.terminate()
+            process.wait(timeout=5)
+        except ProcessLookupError:
+            return
+        except subprocess.TimeoutExpired:
+            try:
+                if os.name == "posix":
+                    os.killpg(process.pid, signal.SIGKILL)
+                else:
+                    process.kill()
+            except ProcessLookupError:
+                return
 
     def _run(self, job: Job) -> None:
         job.status = "running"
@@ -589,7 +617,9 @@ class JobManager:
             if job.cancel.is_set():
                 raise RuntimeError("cancelled")
             target = download_dir / f"{item.chart_id}.zip"
-            self._download(f"{NOAA_ENC_BASE_URL}/{item.chart_id}.zip", target)
+            self._download(
+                f"{NOAA_ENC_BASE_URL}/{item.chart_id}.zip", target, job.cancel
+            )
             return item, target
 
         workers = min(job.config["download_workers"], len(included))
@@ -609,7 +639,7 @@ class JobManager:
         if not downloaded:
             raise RuntimeError("No NOAA ENC cells downloaded successfully")
         for index, (item, archive) in enumerate(downloaded, 1):
-            self._safe_extract(archive, enc_root / item.chart_id)
+            self._safe_extract(archive, enc_root / item.chart_id, job.cancel)
             archive.unlink(missing_ok=True)
             self.update(job, "Extracting ENC archives", 0.30 + 0.05 * index / len(downloaded))
         outputs = self._build_enc(job, enc_root, job_dir, safe_stem(job.name))
@@ -624,7 +654,7 @@ class JobManager:
             index, url = index_url
             path_name = unquote(Path(urlparse(url).path).name) or f"download-{index}"
             target = input_root / f"{index:02d}-{safe_stem(path_name, f'download-{index}')}"
-            self._download(url, target)
+            self._download(url, target, job.cancel)
             return target
 
         downloaded: list[Path] = []
@@ -638,7 +668,7 @@ class JobManager:
         expanded.mkdir()
         for item in downloaded:
             if item.suffix.lower() == ".zip":
-                self._safe_extract(item, expanded / safe_stem(item.stem))
+                self._safe_extract(item, expanded / safe_stem(item.stem), job.cancel)
             else:
                 target = expanded / item.name
                 shutil.copy2(item, target)
@@ -671,21 +701,34 @@ class JobManager:
         if not job.outputs:
             raise RuntimeError("No supported chart files found. Use ENC ZIP, GeoJSON, MBTiles, PMTiles, KAP, or GeoTIFF links")
 
-    def _download(self, url: str, target: Path) -> None:
+    def _download(
+        self, url: str, target: Path, cancel: threading.Event | None = None
+    ) -> None:
         target.parent.mkdir(parents=True, exist_ok=True)
         temp = target.with_suffix(target.suffix + ".part")
         total = 0
-        with httpx.stream("GET", url, follow_redirects=True, timeout=httpx.Timeout(60, read=180)) as response:
-            response.raise_for_status()
-            with temp.open("wb") as handle:
-                for chunk in response.iter_bytes(1024 * 1024):
-                    total += len(chunk)
-                    if total > MAX_DOWNLOAD_BYTES:
-                        raise RuntimeError(f"Download exceeded 20 GiB: {url}")
-                    handle.write(chunk)
-        temp.replace(target)
+        try:
+            with httpx.stream("GET", url, follow_redirects=True, timeout=httpx.Timeout(60, read=180)) as response:
+                response.raise_for_status()
+                with temp.open("wb") as handle:
+                    for chunk in response.iter_bytes(1024 * 1024):
+                        if cancel is not None and cancel.is_set():
+                            raise RuntimeError("cancelled")
+                        total += len(chunk)
+                        if total > MAX_DOWNLOAD_BYTES:
+                            raise RuntimeError(f"Download exceeded 20 GiB: {url}")
+                        handle.write(chunk)
+            temp.replace(target)
+        except Exception:
+            temp.unlink(missing_ok=True)
+            raise
 
-    def _safe_extract(self, archive: Path, destination: Path) -> None:
+    def _safe_extract(
+        self,
+        archive: Path,
+        destination: Path,
+        cancel: threading.Event | None = None,
+    ) -> None:
         destination.mkdir(parents=True, exist_ok=True)
         root = destination.resolve()
         with zipfile.ZipFile(archive) as bundle:
@@ -693,6 +736,8 @@ class JobManager:
             if len(entries) > MAX_ARCHIVE_FILES or sum(item.file_size for item in entries) > MAX_ARCHIVE_BYTES:
                 raise RuntimeError(f"Archive exceeds extraction safety limits: {archive.name}")
             for item in entries:
+                if cancel is not None and cancel.is_set():
+                    raise RuntimeError("cancelled")
                 target = (destination / item.filename).resolve()
                 if target != root and root not in target.parents:
                     raise RuntimeError(f"Unsafe archive path in {archive.name}")
@@ -701,7 +746,10 @@ class JobManager:
                 else:
                     target.parent.mkdir(parents=True, exist_ok=True)
                     with bundle.open(item) as source, target.open("wb") as output:
-                        shutil.copyfileobj(source, output, 1024 * 1024)
+                        while chunk := source.read(1024 * 1024):
+                            if cancel is not None and cancel.is_set():
+                                raise RuntimeError("cancelled")
+                            output.write(chunk)
 
     def _container_base(self, name: str, mounts: list[tuple[Path, str, bool]], env: dict[str, str] | None = None) -> list[str]:
         if self.runtime is None:
@@ -732,6 +780,7 @@ class JobManager:
                 text=True,
                 bufsize=1,
                 env=container_subprocess_environment(),
+                start_new_session=os.name == "posix",
             )
             with job.process_lock:
                 job.processes.append(process)
@@ -742,7 +791,7 @@ class JobManager:
                     del recent[:-30]
                     self.append(job, line)
                     if job.cancel.is_set():
-                        process.terminate()
+                        self._terminate_process(process)
                         break
                 code = process.wait()
             finally:
@@ -972,6 +1021,8 @@ class ProgressiveController:
         )
         self.stop_event = threading.Event()
         self.source_lock = threading.Lock()
+        self.active_condition = threading.Condition()
+        self.active_builds: dict[str, tuple[str, Job]] = {}
         self.worker = threading.Thread(
             target=self._worker_loop,
             name="progressive-chart-local-worker",
@@ -983,7 +1034,10 @@ class ProgressiveController:
 
     def stop(self) -> None:
         self.stop_event.set()
-        self.worker.join(timeout=5)
+        with self.active_condition:
+            builds = [build for _, build in self.active_builds.values()]
+        self._cancel_builds(builds)
+        self.worker.join(timeout=20)
 
     def create(self, request: ProgressiveNoaaRequest) -> dict[str, Any]:
         included = self.catalog.inclusion(request.chart_ids)
@@ -1124,11 +1178,232 @@ class ProgressiveController:
         return {
             "local_worker": self.builder.runtime is not None,
             "tasks": [job.to_dict() for job in self.queue.jobs()],
+            "chart_sets": self.chart_sets(),
             "charts": [
                 self.registry.descriptor(chart.identifier, api_version=2)
                 for chart in self.registry.charts()
             ],
         }
+
+    def chart_sets(self) -> list[dict[str, Any]]:
+        jobs = self.queue.jobs()
+        records = {chart.identifier: chart for chart in self.registry.charts()}
+        chart_ids = set(records)
+        chart_ids.update(
+            str(job.metadata["chart_id"])
+            for job in jobs
+            if isinstance(job.metadata.get("chart_id"), str)
+        )
+        result: list[dict[str, Any]] = []
+        for chart_id in sorted(chart_ids):
+            chart_jobs = [job for job in jobs if job.metadata.get("chart_id") == chart_id]
+            counts = {
+                status: sum(job.status == status for job in chart_jobs)
+                for status in ("queued", "leased", "paused", "complete", "failed", "cancelled")
+            }
+            paused = self.queue.is_chart_paused(chart_id)
+            record = records.get(chart_id)
+            active_artifact = (
+                record.generations[record.active_generation] if record is not None else None
+            )
+            if paused:
+                state = "paused"
+            elif counts["leased"]:
+                state = "refining" if active_artifact is not None else "building"
+            elif counts["queued"]:
+                state = "refining" if active_artifact is not None else "queued"
+            elif counts["failed"]:
+                state = "failed"
+            elif counts["cancelled"] and active_artifact is None:
+                state = "cancelled"
+            elif active_artifact is not None:
+                state = "ready" if active_artifact.phase == "refined" else "preview"
+            else:
+                state = "idle"
+            latest_job = max(chart_jobs, key=lambda job: job.sequence, default=None)
+            name = (
+                record.name
+                if record is not None
+                else str(latest_job.metadata.get("chart_name", chart_id))
+                if latest_job is not None
+                else chart_id
+            )
+            unfinished = counts["queued"] + counts["leased"]
+            result.append(
+                {
+                    "chart_id": chart_id,
+                    "name": name,
+                    "state": state,
+                    "paused": paused,
+                    "phase": active_artifact.phase if active_artifact is not None else None,
+                    "generation": record.active_generation if record is not None else None,
+                    "task_counts": counts,
+                    "actions": {
+                        "pause": not paused and unfinished > 0,
+                        "resume": paused,
+                        "cancel": unfinished > 0 or paused,
+                        "retry": counts["failed"] + counts["cancelled"] > 0,
+                        "clear_history": counts["failed"] + counts["cancelled"] > 0,
+                        "delete": True,
+                    },
+                }
+            )
+        return result
+
+    def pause_chart(self, chart_id: str) -> dict[str, Any]:
+        chart_id = self._require_chart(chart_id)
+        changed = self.queue.pause_chart(chart_id)
+        return {"chart_id": chart_id, "paused": True, "changed": changed}
+
+    def resume_chart(self, chart_id: str) -> dict[str, Any]:
+        chart_id = self._require_chart(chart_id)
+        changed = self.queue.resume_chart(chart_id)
+        return {"chart_id": chart_id, "paused": False, "changed": changed}
+
+    def cancel_chart(self, chart_id: str) -> dict[str, Any]:
+        chart_id = self._require_chart(chart_id)
+        with self.active_condition:
+            cancelled = self.queue.cancel_chart(chart_id)
+            self.queue.resume_chart(chart_id)
+            builds = [
+                build for active_chart, build in self.active_builds.values()
+                if active_chart == chart_id
+            ]
+        self._cancel_builds(builds)
+        return {"chart_id": chart_id, "cancelled_tasks": len(cancelled)}
+
+    def retry_chart(self, chart_id: str) -> dict[str, Any]:
+        chart_id = self._require_chart(chart_id)
+        retryable = [
+            job
+            for job in self.queue.jobs()
+            if job.metadata.get("chart_id") == chart_id
+            and job.status in {"failed", "cancelled"}
+        ]
+        self._cancel_active_builds(chart_id)
+        if not self._wait_until_inactive(chart_id):
+            raise RuntimeError("Chart conversion is still stopping; retry in a few seconds")
+        for job in retryable:
+            shutil.rmtree(self.data_dir / "tasks" / job.id, ignore_errors=True)
+        retried = self.queue.retry_chart(chart_id)
+        self.queue.resume_chart(chart_id)
+        return {"chart_id": chart_id, "retried_tasks": len(retried)}
+
+    def clear_chart_history(self, chart_id: str) -> dict[str, Any]:
+        chart_id = self._require_chart(chart_id)
+        removed = self.queue.clear_chart_history(chart_id)
+        for job_id in removed:
+            shutil.rmtree(self.data_dir / "tasks" / job_id, ignore_errors=True)
+        self._remove_build_history(removed)
+        return {"chart_id": chart_id, "removed_tasks": len(removed)}
+
+    def delete_chart(self, chart_id: str, *, purge_sources: bool = False) -> dict[str, Any]:
+        chart_id = self._require_chart(chart_id)
+        chart_jobs = [
+            job for job in self.queue.jobs() if job.metadata.get("chart_id") == chart_id
+        ]
+        cell_versions = {
+            (str(cell["chart_id"]), str(cell["version"]))
+            for job in chart_jobs
+            for cell in job.metadata.get("cells", [])
+            if isinstance(cell, dict)
+            and isinstance(cell.get("chart_id"), str)
+            and isinstance(cell.get("version"), str)
+        }
+        with self.active_condition:
+            self.queue.cancel_chart(chart_id)
+            builds = [
+                build for active_chart, build in self.active_builds.values()
+                if active_chart == chart_id
+            ]
+        self._cancel_builds(builds)
+        if not self._wait_until_inactive(chart_id):
+            raise RuntimeError("Chart conversion is still stopping; delete it again in a few seconds")
+        removed_job_ids = self.queue.remove_chart(chart_id)
+        for job_id in removed_job_ids:
+            shutil.rmtree(self.data_dir / "tasks" / job_id, ignore_errors=True)
+        self._remove_build_history(removed_job_ids)
+        artifacts = self.registry.delete_chart(chart_id)
+        source_bytes = 0
+        purged_cells = 0
+        if purge_sources:
+            referenced_versions = {
+                (str(cell["chart_id"]), str(cell["version"]))
+                for job in self.queue.jobs()
+                for cell in job.metadata.get("cells", [])
+                if isinstance(cell, dict)
+                and isinstance(cell.get("chart_id"), str)
+                and isinstance(cell.get("version"), str)
+            }
+            with self.source_lock:
+                for cell_id, version in sorted(cell_versions - referenced_versions):
+                    source = self.data_dir / "sources" / cell_id / safe_stem(version)
+                    source_bytes += self._directory_size(source)
+                    if source.exists():
+                        shutil.rmtree(source)
+                        purged_cells += 1
+                    try:
+                        source.parent.rmdir()
+                    except (FileNotFoundError, OSError):
+                        pass
+        return {
+            "chart_id": chart_id,
+            "removed_tasks": len(removed_job_ids),
+            "removed_generations": artifacts["generations"],
+            "removed_artifact_bytes": artifacts["bytes"],
+            "purged_source_cells": purged_cells,
+            "purged_source_bytes": source_bytes,
+        }
+
+    def _require_chart(self, chart_id: str) -> str:
+        if not SAFE_CHART_ID.fullmatch(chart_id):
+            raise ValueError("Invalid chart identifier")
+        known = self.registry.chart(chart_id) is not None or any(
+            job.metadata.get("chart_id") == chart_id for job in self.queue.jobs()
+        )
+        if not known:
+            raise KeyError(chart_id)
+        return chart_id
+
+    def _cancel_active_builds(self, chart_id: str) -> None:
+        with self.active_condition:
+            builds = [
+                build for active_chart, build in self.active_builds.values()
+                if active_chart == chart_id
+            ]
+        self._cancel_builds(builds)
+
+    def _cancel_builds(self, builds: Iterable[Job]) -> None:
+        for build in builds:
+            try:
+                self.builder.cancel_job(build.id)
+            except KeyError:
+                pass
+
+    def _wait_until_inactive(self, chart_id: str, timeout: float = 20.0) -> bool:
+        deadline = time.monotonic() + timeout
+        with self.active_condition:
+            while any(active_chart == chart_id for active_chart, _ in self.active_builds.values()):
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self.active_condition.wait(min(remaining, 1.0))
+        return True
+
+    def _remove_build_history(self, job_ids: Iterable[str]) -> None:
+        prefixes = tuple(f"p-{job_id[:10]}-" for job_id in job_ids)
+        if not prefixes:
+            return
+        with self.builder.lock:
+            for build_id in list(self.builder.jobs):
+                if build_id.startswith(prefixes):
+                    self.builder.jobs.pop(build_id, None)
+
+    @staticmethod
+    def _directory_size(path: Path) -> int:
+        if not path.exists():
+            return 0
+        return sum(item.stat().st_size for item in path.rglob("*") if item.is_file())
 
     def _worker_loop(self) -> None:
         worker_id = f"local-{os.getpid()}"
@@ -1149,6 +1424,9 @@ class ProgressiveController:
                     try:
                         self.queue.renew(work.id, token)
                     except Exception:
+                        self._cancel_active_builds(
+                            str(work.metadata.get("chart_id", ""))
+                        )
                         return
 
             heartbeat_thread = threading.Thread(target=heartbeat, daemon=True)
@@ -1168,10 +1446,10 @@ class ProgressiveController:
     def _execute(self, work: ProgressiveJob) -> None:
         metadata = work.metadata
         cells = [Footprint(**item) for item in metadata["cells"]]
-        input_root = self._assemble_inputs(work, cells)
         phase: Literal["preview", "refined"] = (
             "preview" if work.target_state == "preview" else "refined"
         )
+        lease_token = work.lease.token if work.lease is not None else ""
         task_dir = self.data_dir / "tasks" / work.id / phase
         task_dir.mkdir(parents=True, exist_ok=True)
         build_job = Job(
@@ -1185,8 +1463,14 @@ class ProgressiveController:
                 "max_zoom": int(metadata["max_zoom"]),
                 "parallelism": int(metadata["parallelism"]),
                 "download_workers": 1,
+                "chart_id": str(metadata["chart_id"]),
             },
         )
+        with self.active_condition:
+            current = self.queue.get(work.id)
+            if current is None or current.status != "leased":
+                raise RuntimeError("Chart task was cancelled before it started")
+            self.active_builds[work.id] = (str(metadata["chart_id"]), build_job)
         with self.builder.lock:
             self.builder.jobs[build_job.id] = build_job
         requested_layers = tuple(str(item) for item in metadata["requested_layers"])
@@ -1198,6 +1482,9 @@ class ProgressiveController:
             else None
         )
         try:
+            input_root = self._assemble_inputs(work, cells, build_job.cancel)
+            if build_job.cancel.is_set():
+                raise RuntimeError("cancelled")
             outputs = self.builder._build_enc(
                 build_job,
                 input_root,
@@ -1215,38 +1502,66 @@ class ProgressiveController:
             artifact_dir.mkdir(parents=True, exist_ok=True)
             artifact = artifact_dir / f"{generation}.mbtiles"
             partial = artifact.with_suffix(".part.mbtiles")
-            shutil.copy2(source, partial)
-            partial.replace(artifact)
-            self.registry.register_mbtiles(
-                str(metadata["chart_id"]),
-                generation,
-                artifact,
-                phase=phase,
-                profile=str(metadata["profile"]),
-                name=str(metadata["chart_name"]),
-                description=(
-                    "NOAA S-57 ENC progressive preview"
-                    if phase == "preview"
-                    else "NOAA S-57 ENC refined vector chart"
-                ),
-            )
+            with self.active_condition:
+                current = self.queue.get(work.id)
+                if (
+                    current is None
+                    or current.status != "leased"
+                    or current.lease is None
+                    or current.lease.token != lease_token
+                    or build_job.cancel.is_set()
+                ):
+                    raise RuntimeError("Chart task was cancelled before publication")
+                existing = self.registry.chart(str(metadata["chart_id"]))
+                active_is_refined = (
+                    existing is not None
+                    and existing.generations[existing.active_generation].phase == "refined"
+                )
+                shutil.copy2(source, partial)
+                partial.replace(artifact)
+                self.registry.register_mbtiles(
+                    str(metadata["chart_id"]),
+                    generation,
+                    artifact,
+                    phase=phase,
+                    profile=str(metadata["profile"]),
+                    name=str(metadata["chart_name"]),
+                    description=(
+                        "NOAA S-57 ENC progressive preview"
+                        if phase == "preview"
+                        else "NOAA S-57 ENC refined vector chart"
+                    ),
+                    activate=not (phase == "preview" and active_is_refined),
+                )
             build_job.outputs = [source.name]
             build_job.status = "completed"
             build_job.phase = f"Published {phase} generation {generation}"
             build_job.progress = 1.0
         except Exception as error:
-            build_job.status = "failed"
-            build_job.phase = "Failed"
+            build_job.status = "cancelled" if build_job.cancel.is_set() else "failed"
+            build_job.phase = "Cancelled" if build_job.cancel.is_set() else "Failed"
             build_job.error = str(error)
             raise
         finally:
             build_job.updated_at = utc_now()
+            with self.active_condition:
+                self.active_builds.pop(work.id, None)
+                self.active_condition.notify_all()
 
-    def _assemble_inputs(self, work: ProgressiveJob, cells: list[Footprint]) -> Path:
+    def _assemble_inputs(
+        self,
+        work: ProgressiveJob,
+        cells: list[Footprint],
+        cancel: threading.Event | None = None,
+    ) -> Path:
         packet_root = self.data_dir / "tasks" / work.id / "input"
         packet_root.mkdir(parents=True, exist_ok=True)
         for cell in cells:
-            source = self._ensure_cell(cell)
+            if cancel is not None and cancel.is_set():
+                raise RuntimeError("cancelled")
+            source = self._ensure_cell(cell, cancel)
+            if cancel is not None and cancel.is_set():
+                raise RuntimeError("cancelled")
             target = packet_root / cell.chart_id
             if target.exists():
                 continue
@@ -1261,24 +1576,28 @@ class ProgressiveController:
             shutil.copytree(source, target, copy_function=link_or_copy)
         return packet_root
 
-    def _ensure_cell(self, cell: Footprint) -> Path:
+    def _ensure_cell(
+        self, cell: Footprint, cancel: threading.Event | None = None
+    ) -> Path:
         cell_root = self.data_dir / "sources" / cell.chart_id / safe_stem(cell.version)
         extracted = cell_root / "enc"
         marker = cell_root / ".complete"
         if marker.exists() and extracted.exists():
             return extracted
         with self.source_lock:
+            if cancel is not None and cancel.is_set():
+                raise RuntimeError("cancelled")
             if marker.exists() and extracted.exists():
                 return extracted
             cell_root.mkdir(parents=True, exist_ok=True)
             archive = cell_root / f"{cell.chart_id}.zip"
             if not archive.exists():
                 self.builder._download(
-                    f"{NOAA_ENC_BASE_URL}/{cell.chart_id}.zip", archive
+                    f"{NOAA_ENC_BASE_URL}/{cell.chart_id}.zip", archive, cancel
                 )
             staging = cell_root / f".extract-{uuid.uuid4().hex[:8]}"
             try:
-                self.builder._safe_extract(archive, staging)
+                self.builder._safe_extract(archive, staging, cancel)
                 if extracted.exists():
                     shutil.rmtree(staging, ignore_errors=True)
                 else:
@@ -1506,6 +1825,48 @@ def create_app(data_dir: Path = DEFAULT_DATA_DIR, runtime: str = "auto") -> Fast
     def progressive_status() -> dict[str, Any]:
         return progressive.status()
 
+    def chart_action(action: Callable[[], dict[str, Any]]) -> dict[str, Any]:
+        try:
+            return action()
+        except KeyError as error:
+            raise HTTPException(404, "Unknown progressive chart") from error
+        except ValueError as error:
+            raise HTTPException(422, str(error)) from error
+        except RuntimeError as error:
+            raise HTTPException(409, str(error)) from error
+
+    @app.post("/api/progressive/charts/{chart_id}/pause", status_code=202)
+    def pause_progressive_chart(chart_id: str) -> dict[str, Any]:
+        return chart_action(lambda: progressive.pause_chart(chart_id))
+
+    @app.post("/api/progressive/charts/{chart_id}/resume", status_code=202)
+    def resume_progressive_chart(chart_id: str) -> dict[str, Any]:
+        return chart_action(lambda: progressive.resume_chart(chart_id))
+
+    @app.post("/api/progressive/charts/{chart_id}/cancel", status_code=202)
+    def cancel_progressive_chart(chart_id: str) -> dict[str, Any]:
+        return chart_action(lambda: progressive.cancel_chart(chart_id))
+
+    @app.post("/api/progressive/charts/{chart_id}/retry", status_code=202)
+    def retry_progressive_chart(chart_id: str) -> dict[str, Any]:
+        return chart_action(lambda: progressive.retry_chart(chart_id))
+
+    @app.post("/api/progressive/charts/{chart_id}/history/clear")
+    def clear_progressive_chart_history(chart_id: str) -> dict[str, Any]:
+        return chart_action(lambda: progressive.clear_chart_history(chart_id))
+
+    @app.post("/api/progressive/charts/{chart_id}/delete")
+    def delete_progressive_chart(
+        chart_id: str, request: ProgressiveDeleteRequest
+    ) -> dict[str, Any]:
+        if request.confirm_chart_id != chart_id:
+            raise HTTPException(422, "confirm_chart_id must match the chart identifier")
+        return chart_action(
+            lambda: progressive.delete_chart(
+                chart_id, purge_sources=request.purge_sources
+            )
+        )
+
     @app.get("/api/provider/charts")
     def provider_charts() -> dict[str, Any]:
         return {
@@ -1582,7 +1943,7 @@ UI_HTML = r'''<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Charts Provider Progressive</title>
 <style>
-:root{color-scheme:dark;--bg:#07131a;--panel:#0d2029;--line:#22414d;--ink:#ecf7f5;--muted:#91aab1;--sea:#0a2734;--cyan:#50d6ca;--lime:#c5ed72;--amber:#ffc56e;--red:#ff766f}*{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at 65% -10%,#123949 0,transparent 38%),var(--bg);color:var(--ink);font:15px/1.45 ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}button,input,textarea,select{font:inherit}button{cursor:pointer}header{padding:28px clamp(18px,4vw,54px) 20px;display:flex;gap:20px;align-items:end;justify-content:space-between}h1{margin:0;font-size:clamp(28px,4vw,48px);letter-spacing:-.04em}.eyebrow{color:var(--cyan);text-transform:uppercase;letter-spacing:.14em;font-size:12px;font-weight:800}.lede{margin:7px 0 0;color:var(--muted);max-width:720px}.status{border:1px solid var(--line);background:#0a1a21;padding:9px 13px;border-radius:999px;white-space:nowrap}.status.good{color:var(--lime)}main{padding:0 clamp(18px,4vw,54px) 48px;display:grid;grid-template-columns:minmax(0,1.7fr) minmax(320px,.8fr);gap:20px}.panel{background:color-mix(in srgb,var(--panel) 94%,transparent);border:1px solid var(--line);border-radius:18px;overflow:hidden;box-shadow:0 18px 50px #0005}.panel-head{padding:18px 20px;border-bottom:1px solid var(--line);display:flex;align-items:center;justify-content:space-between;gap:12px}.panel-head h2,.form h3{margin:0;font-size:17px}.count{color:var(--muted);font-variant-numeric:tabular-nums}.map-wrap{position:relative;height:min(58vh,620px);min-height:420px;background:var(--sea)}canvas{width:100%;height:100%;display:block;touch-action:none}.map-tools{position:absolute;top:12px;left:12px;right:12px;display:flex;gap:8px;pointer-events:none}.map-tools>*{pointer-events:auto}.map-attribution{position:absolute;left:9px;bottom:8px;padding:3px 7px;border-radius:5px;background:#07131acc;color:#d8e5e3;font-size:10px;line-height:1.25}.map-attribution a{color:inherit}.search{flex:1;min-width:0}.field,textarea,select{width:100%;border:1px solid var(--line);background:#081920;color:var(--ink);border-radius:10px;padding:10px 12px;outline:none}.field:focus,textarea:focus,select:focus{border-color:var(--cyan);box-shadow:0 0 0 3px #50d6ca22}.btn{border:1px solid var(--line);background:#112b35;color:var(--ink);padding:10px 13px;border-radius:10px;font-weight:750}.btn:hover{border-color:#3a6573}.btn.primary{background:var(--cyan);border-color:var(--cyan);color:#041315}.btn.accent{background:var(--lime);border-color:var(--lime);color:#101904}.btn.danger{color:var(--red)}.forms{display:grid;grid-template-columns:1fr 1fr;border-top:1px solid var(--line)}.form{padding:18px 20px}.form+.form{border-left:1px solid var(--line)}label{display:block;margin:12px 0 5px;color:var(--muted);font-size:12px;font-weight:750}.row{display:grid;grid-template-columns:1fr 1fr;gap:10px}.hint{color:var(--muted);font-size:12px;margin:8px 0}.aside{display:flex;flex-direction:column;min-height:660px}.jobs{padding:12px;display:flex;flex-direction:column;gap:10px;overflow:auto;max-height:calc(100vh - 150px)}.job{border:1px solid var(--line);border-radius:13px;background:#091a21;padding:13px}.job-top{display:flex;justify-content:space-between;gap:12px}.job-title{font-weight:800}.job-phase{color:var(--muted);font-size:12px;margin:3px 0 9px}.badge{font-size:11px;text-transform:uppercase;letter-spacing:.08em;color:var(--amber)}.badge.completed{color:var(--lime)}.badge.failed{color:var(--red)}progress{width:100%;height:7px;accent-color:var(--cyan)}details{margin-top:9px}summary{color:var(--muted);font-size:12px;cursor:pointer}pre{white-space:pre-wrap;word-break:break-word;background:#041016;border-radius:8px;padding:9px;max-height:180px;overflow:auto;font:11px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace}.actions{display:flex;gap:7px;flex-wrap:wrap;margin-top:9px}.actions .btn{padding:6px 9px;font-size:12px}.empty{padding:30px 18px;color:var(--muted);text-align:center}.note{padding:12px 20px;border-top:1px solid var(--line);color:var(--muted);font-size:12px}dialog{border:1px solid var(--line);background:var(--panel);color:var(--ink);border-radius:16px;width:min(460px,calc(100vw - 30px));padding:20px}dialog::backdrop{background:#000a}.error{color:var(--red)}@media(max-width:920px){main{grid-template-columns:1fr}.aside{min-height:400px}.jobs{max-height:600px}}@media(max-width:650px){header{align-items:start;flex-direction:column}.forms{grid-template-columns:1fr}.form+.form{border-left:0;border-top:1px solid var(--line)}.map-wrap{min-height:360px}.map-tools{flex-wrap:wrap}.search{flex-basis:100%}}
+:root{color-scheme:dark;--bg:#07131a;--panel:#0d2029;--line:#22414d;--ink:#ecf7f5;--muted:#91aab1;--sea:#0a2734;--cyan:#50d6ca;--lime:#c5ed72;--amber:#ffc56e;--red:#ff766f}*{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at 65% -10%,#123949 0,transparent 38%),var(--bg);color:var(--ink);font:15px/1.45 ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}button,input,textarea,select{font:inherit}button{cursor:pointer}header{padding:28px clamp(18px,4vw,54px) 20px;display:flex;gap:20px;align-items:end;justify-content:space-between}h1{margin:0;font-size:clamp(28px,4vw,48px);letter-spacing:-.04em}.eyebrow{color:var(--cyan);text-transform:uppercase;letter-spacing:.14em;font-size:12px;font-weight:800}.lede{margin:7px 0 0;color:var(--muted);max-width:720px}.status{border:1px solid var(--line);background:#0a1a21;padding:9px 13px;border-radius:999px;white-space:nowrap}.status.good{color:var(--lime)}main{padding:0 clamp(18px,4vw,54px) 48px;display:grid;grid-template-columns:minmax(0,1.7fr) minmax(320px,.8fr);gap:20px}.panel{background:color-mix(in srgb,var(--panel) 94%,transparent);border:1px solid var(--line);border-radius:18px;overflow:hidden;box-shadow:0 18px 50px #0005}.panel-head{padding:18px 20px;border-bottom:1px solid var(--line);display:flex;align-items:center;justify-content:space-between;gap:12px}.panel-head h2,.form h3{margin:0;font-size:17px}.count{color:var(--muted);font-variant-numeric:tabular-nums}.map-wrap{position:relative;height:min(58vh,620px);min-height:420px;background:var(--sea)}canvas{width:100%;height:100%;display:block;touch-action:none}.map-tools{position:absolute;top:12px;left:12px;right:12px;display:flex;gap:8px;pointer-events:none}.map-tools>*{pointer-events:auto}.map-attribution{position:absolute;left:9px;bottom:8px;padding:3px 7px;border-radius:5px;background:#07131acc;color:#d8e5e3;font-size:10px;line-height:1.25}.map-attribution a{color:inherit}.search{flex:1;min-width:0}.field,textarea,select{width:100%;border:1px solid var(--line);background:#081920;color:var(--ink);border-radius:10px;padding:10px 12px;outline:none}.field:focus,textarea:focus,select:focus{border-color:var(--cyan);box-shadow:0 0 0 3px #50d6ca22}.btn{border:1px solid var(--line);background:#112b35;color:var(--ink);padding:10px 13px;border-radius:10px;font-weight:750}.btn:hover{border-color:#3a6573}.btn.primary{background:var(--cyan);border-color:var(--cyan);color:#041315}.btn.accent{background:var(--lime);border-color:var(--lime);color:#101904}.btn.danger{color:var(--red)}.forms{display:grid;grid-template-columns:1fr 1fr;border-top:1px solid var(--line)}.form{padding:18px 20px}.form+.form{border-left:1px solid var(--line)}label{display:block;margin:12px 0 5px;color:var(--muted);font-size:12px;font-weight:750}.row{display:grid;grid-template-columns:1fr 1fr;gap:10px}.hint{color:var(--muted);font-size:12px;margin:8px 0}.aside{display:flex;flex-direction:column;min-height:660px}.jobs{padding:12px;display:flex;flex-direction:column;gap:10px;overflow:auto;max-height:calc(100vh - 150px)}.job{border:1px solid var(--line);border-radius:13px;background:#091a21;padding:13px}.job-top{display:flex;justify-content:space-between;gap:12px}.job-title{font-weight:800}.job-phase{color:var(--muted);font-size:12px;margin:3px 0 9px}.badge{font-size:11px;text-transform:uppercase;letter-spacing:.08em;color:var(--amber)}.badge.completed,.badge.ready,.badge.preview{color:var(--lime)}.badge.failed,.badge.cancelled{color:var(--red)}.badge.paused{color:var(--cyan)}progress{width:100%;height:7px;accent-color:var(--cyan)}details{margin-top:9px}summary{color:var(--muted);font-size:12px;cursor:pointer}pre{white-space:pre-wrap;word-break:break-word;background:#041016;border-radius:8px;padding:9px;max-height:180px;overflow:auto;font:11px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace}.actions{display:flex;gap:7px;flex-wrap:wrap;margin-top:9px}.actions .btn{padding:6px 9px;font-size:12px}.empty{padding:30px 18px;color:var(--muted);text-align:center}.note{padding:12px 20px;border-top:1px solid var(--line);color:var(--muted);font-size:12px}dialog{border:1px solid var(--line);background:var(--panel);color:var(--ink);border-radius:16px;width:min(460px,calc(100vw - 30px));padding:20px}dialog::backdrop{background:#000a}.error{color:var(--red)}@media(max-width:920px){main{grid-template-columns:1fr}.aside{min-height:400px}.jobs{max-height:600px}}@media(max-width:650px){header{align-items:start;flex-direction:column}.forms{grid-template-columns:1fr}.form+.form{border-left:0;border-top:1px solid var(--line)}.map-wrap{min-height:360px}.map-tools{flex-wrap:wrap}.search{flex-basis:100%}}
 </style></head><body>
 <header><div><div class="eyebrow">Local-first progressive charts</div><h1>Charts Provider Progressive</h1><p class="lede">Select NOAA ENC coverage, publish the current view quickly, then improve zoom levels, nearby coverage, and full fidelity in the background.</p></div><div id="runtime" class="status">Checking runtime…</div></header>
 <main><section class="panel"><div class="panel-head"><h2>NOAA ENC coverage</h2><span id="selectionCount" class="count">Loading catalog…</span></div><div class="map-wrap"><canvas id="map" aria-label="Interactive NOAA ENC coverage map"></canvas><div class="map-tools"><input id="search" class="field search" placeholder="Find chart id or place"><button class="btn" id="california">California preset</button><button class="btn" id="clear">Clear</button></div><div class="map-attribution"><a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">© OpenStreetMap contributors</a><span id="mapStatus"> · NOAA ENC Online</span></div></div><div class="forms"><form class="form" id="noaaForm"><h3>Start progressive chart</h3><label for="noaaName">Chart set name</label><input class="field" id="noaaName" value="NOAA ENC California" required><div class="row"><div><label for="minZoom">Minimum zoom</label><input class="field" id="minZoom" type="number" min="0" max="18" value="4"></div><div><label for="maxZoom">Maximum zoom</label><input class="field" id="maxZoom" type="number" min="0" max="18" value="16"></div></div><div class="row"><div><label for="parallelism">Local CPU workers</label><input class="field" id="parallelism" type="number" min="1" max="32" value="1"></div><div><label for="profile">Layer profile</label><select id="profile"><option value="compatible">Compatible portrayal</option><option value="full">Full S-57</option></select></div></div><p class="hint">The visible map view is built first. Adjacent zooms, surrounding coverage, the selected region, and the refined chart follow automatically. A future release can expose individual layer selection.</p><button class="btn primary" type="submit">Start progressive chart</button></form><form class="form" id="urlForm"><h3>Build from links</h3><label for="urlName">Chart set name</label><input class="field" id="urlName" value="Imported charts" required><label for="urls">Direct chart links, one per line</label><textarea id="urls" rows="5" placeholder="https://…/enc.zip&#10;https://…/chart.mbtiles"></textarea><p class="hint">Linked-file conversion remains available as a batch operation. Progressive NOAA charts are always built by the local worker and published as soon as each generation is ready.</p><button class="btn" type="submit">Build linked files</button></form></div><div class="note">Navigation warning: generated charts are supplemental and must not be your sole means of navigation.</div></section><aside class="panel aside"><div class="panel-head"><h2>Build queue</h2><button class="btn" id="refreshJobs">Refresh</button></div><div id="jobs" class="jobs"><div class="empty">No builds yet.</div></div></aside></main>
@@ -1618,7 +1979,11 @@ function currentZoom(){return Math.max(0,Math.min(18,Math.round(Math.log2(state.
 $('#noaaForm').onsubmit=async e=>{e.preventDefault();if(!state.selected.size)return alert('Select at least one NOAA approach cell.');try{await api('/api/progressive/noaa',{method:'POST',body:JSON.stringify({name:$('#noaaName').value,chart_ids:[...state.selected],viewport_bbox:viewportBounds(),current_zoom:currentZoom(),min_zoom:+$('#minZoom').value,max_zoom:+$('#maxZoom').value,parallelism:+$('#parallelism').value,download_workers:2,profile:$('#profile').value})});await jobs()}catch(x){alert(x.message)}};
 $('#urlForm').onsubmit=async e=>{e.preventDefault();const urls=$('#urls').value.split(/\n/).map(x=>x.trim()).filter(Boolean);if(!urls.length)return alert('Add at least one direct chart link.');try{await api('/api/jobs/url',{method:'POST',body:JSON.stringify({name:$('#urlName').value,urls,min_zoom:+$('#minZoom').value,max_zoom:+$('#maxZoom').value,parallelism:+$('#parallelism').value,download_workers:4})});await jobs()}catch(x){alert(x.message)}};
 function esc(x){return String(x).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
-async function jobs(){const [list,p]=await Promise.all([api('/api/jobs'),api('/api/progressive/status')]);const charts=p.charts.map(c=>`<article class="job"><div class="job-top"><div><div class="job-title">${esc(c.name)}</div><div class="job-phase">Published ${esc(c.phase)} generation ${esc(c.generation)}</div></div><span class="badge completed">available</span></div><div class="hint">Zoom ${c.minzoom}–${c.maxzoom} · ${c.layers.length} layers</div></article>`);const tasks=p.tasks.map(t=>{const value=t.chart_state==='refined'||t.status==='complete'?1:t.chart_state==='preview'?.5:t.status==='leased'?.2:0;return `<article class="job"><div class="job-top"><div><div class="job-title">${esc(t.metadata.chart_name||t.key.packet)}</div><div class="job-phase">${esc(t.metadata.packet_name||t.key.packet)} · ${esc(t.target_state)}</div></div><span class="badge ${t.status}">${esc(t.status)}</span></div><progress max="1" value="${value}"></progress>${t.error?`<p class="error">${esc(t.error)}</p>`:''}</article>`});const batches=list.filter(j=>j.kind!=='progressive').map(j=>`<article class="job"><div class="job-top"><div><div class="job-title">${esc(j.name)}</div><div class="job-phase">${esc(j.phase)} · ${Math.round(j.progress*100)}%</div></div><span class="badge ${j.status}">${esc(j.status)}</span></div><progress max="1" value="${j.progress}"></progress>${j.error?`<p class="error">${esc(j.error)}</p>`:''}<div class="actions">${j.outputs.map(f=>`<a class="btn" href="/api/jobs/${j.id}/files/${encodeURIComponent(f)}">Download ${esc(f)}</a>`).join('')}${j.status==='completed'?`<button class="btn accent" onclick="openSideload('${j.id}')">Send to Pi</button>`:''}${j.status==='running'?`<button class="btn danger" onclick="cancelJob('${j.id}')">Cancel</button>`:''}</div><details><summary>Build log</summary><pre>${esc(j.log.join('\n'))}</pre></details></article>`);const cards=[...charts,...tasks,...batches];$('#jobs').innerHTML=cards.length?cards.join(''):'<div class="empty">No builds yet.</div>'}
+function taskSummary(counts){return Object.entries(counts).filter(([,n])=>n).map(([status,n])=>`${n} ${status}`).join(' · ')||'No queued work'}
+function chartButtons(chart){const a=chart.actions,id=chart.chart_id,buttons=[];if(a.pause)buttons.push(`<button class="btn" onclick="chartAction('${id}','pause')">Pause</button>`);if(a.resume)buttons.push(`<button class="btn accent" onclick="chartAction('${id}','resume')">Resume</button>`);if(a.cancel)buttons.push(`<button class="btn danger" onclick="chartAction('${id}','cancel',true)">Stop build</button>`);if(a.retry)buttons.push(`<button class="btn" onclick="chartAction('${id}','retry')">Retry failed</button>`);if(a.clear_history)buttons.push(`<button class="btn" onclick="chartAction('${id}','history/clear',true)">Clear history</button>`);if(a.delete)buttons.push(`<button class="btn danger" onclick="deleteChart('${id}')">Delete chart</button>`);return buttons.join('')}
+async function jobs(){const [list,p]=await Promise.all([api('/api/jobs'),api('/api/progressive/status')]);const chartSets=p.chart_sets.map(c=>`<article class="job"><div class="job-top"><div><div class="job-title">${esc(c.name)}</div><div class="job-phase">${c.generation?`Published ${esc(c.phase)} generation ${esc(c.generation)}`:'No published generation'}</div></div><span class="badge ${esc(c.state)}">${esc(c.state)}</span></div><div class="hint">${esc(taskSummary(c.task_counts))}</div><div class="actions">${chartButtons(c)}</div></article>`);const batches=list.filter(j=>j.kind!=='progressive').map(j=>`<article class="job"><div class="job-top"><div><div class="job-title">${esc(j.name)}</div><div class="job-phase">${esc(j.phase)} · ${Math.round(j.progress*100)}%</div></div><span class="badge ${j.status}">${esc(j.status)}</span></div><progress max="1" value="${j.progress}"></progress>${j.error?`<p class="error">${esc(j.error)}</p>`:''}<div class="actions">${j.outputs.map(f=>`<a class="btn" href="/api/jobs/${j.id}/files/${encodeURIComponent(f)}">Download ${esc(f)}</a>`).join('')}${j.status==='completed'?`<button class="btn accent" onclick="openSideload('${j.id}')">Send to Pi</button>`:''}${j.status==='running'?`<button class="btn danger" onclick="cancelJob('${j.id}')">Cancel</button>`:''}</div><details><summary>Build log</summary><pre>${esc(j.log.join('\n'))}</pre></details></article>`);const cards=[...chartSets,...batches];$('#jobs').innerHTML=cards.length?cards.join(''):'<div class="empty">No builds yet.</div>'}
+async function chartAction(id,action,confirmAction=false){if(confirmAction&&!confirm(`${action==='cancel'?'Stop all unfinished work for':'Clear failed and cancelled history for'} ${id}?`))return;try{await api(`/api/progressive/charts/${encodeURIComponent(id)}/${action}`,{method:'POST',body:'{}'});await jobs()}catch(x){alert(x.message)}}
+async function deleteChart(id){if(!confirm(`Delete ${id}, its build history, and all published generations?`))return;const purge=confirm('Also remove downloaded NOAA source cells that no other chart set uses? Select Cancel to retain the shared source cache.');try{await api(`/api/progressive/charts/${encodeURIComponent(id)}/delete`,{method:'POST',body:JSON.stringify({confirm_chart_id:id,purge_sources:purge})});await jobs()}catch(x){alert(x.message)}}
 $('#refreshJobs').onclick=jobs;async function cancelJob(id){await api(`/api/jobs/${id}/cancel`,{method:'POST'});jobs()}function openSideload(id){$('#sideloadJob').value=id;$('#sideloadError').textContent='';$('#sideloadDialog').showModal()}$('#sideloadForm').addEventListener('submit',async e=>{if(e.submitter?.value!=='send')return;e.preventDefault();$('#sideloadError').textContent='Sending…';try{const r=await api('/api/sideload',{method:'POST',body:JSON.stringify({job_id:$('#sideloadJob').value,target:$('#sshTarget').value,destination:$('#destination').value,mbtiles_dir:$('#mbtilesDir').value,pmtiles_dir:$('#pmtilesDir').value,remote_owner:$('#remoteOwner').value||null,restart_signalk:$('#restartSignalk').checked})});$('#sideloadError').textContent=`Sent ${r.files.length} file(s) to ${r.target}${r.restarted_signalk?' and restarted Signal K':''}`;setTimeout(()=>$('#sideloadDialog').close(),2200)}catch(x){$('#sideloadError').textContent=x.message}});setInterval(jobs,2000);
 </script></body></html>'''
 

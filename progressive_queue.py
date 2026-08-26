@@ -16,7 +16,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from enum import IntEnum
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 
 
 STATE_VERSION = 1
@@ -205,6 +205,7 @@ class ProgressiveQueue:
         self._lock = threading.RLock()
         self._jobs: Dict[str, ProgressiveJob] = {}
         self._by_key: Dict[str, str] = {}
+        self._paused_charts: Set[str] = set()
         self._next_sequence = 0
         self._load()
 
@@ -268,6 +269,10 @@ class ProgressiveQueue:
         normalized_layers = _normalize_layers(layers)
         normalized_metadata = dict(metadata or {})
         _json_bytes(normalized_metadata)
+        if "chart_id" in normalized_metadata:
+            normalized_metadata["chart_id"] = _chart_identifier(
+                normalized_metadata["chart_id"]
+            )
         with self._lock:
             existing_id = self._by_key.get(key.canonical)
             if existing_id is not None:
@@ -335,7 +340,11 @@ class ProgressiveQueue:
             raise ValueError("lease_seconds must be positive")
         with self._lock:
             changed = self._requeue_expired_locked()
-            queued = [job for job in self._jobs.values() if job.status == "queued"]
+            queued = [
+                job
+                for job in self._jobs.values()
+                if job.status == "queued" and not self._job_is_paused(job)
+            ]
             if not queued:
                 if changed:
                     self._save_locked()
@@ -432,6 +441,112 @@ class ProgressiveQueue:
                 self._save_locked()
             return expired
 
+    def pause_chart(self, chart_id: str) -> bool:
+        """Pause new leases for a chart without disturbing active workers."""
+
+        chart_id = _chart_identifier(chart_id)
+        with self._lock:
+            if chart_id in self._paused_charts:
+                return False
+            self._paused_charts.add(chart_id)
+            self._save_locked()
+            return True
+
+    def resume_chart(self, chart_id: str) -> bool:
+        chart_id = _chart_identifier(chart_id)
+        with self._lock:
+            if chart_id not in self._paused_charts:
+                return False
+            self._paused_charts.remove(chart_id)
+            self._save_locked()
+            return True
+
+    def is_chart_paused(self, chart_id: str) -> bool:
+        chart_id = _chart_identifier(chart_id)
+        with self._lock:
+            return chart_id in self._paused_charts
+
+    def paused_charts(self) -> List[str]:
+        with self._lock:
+            return sorted(self._paused_charts)
+
+    def cancel_chart(self, chart_id: str) -> List[ProgressiveJob]:
+        """Cancel unfinished chart work and invalidate any matching leases."""
+
+        chart_id = _chart_identifier(chart_id)
+        with self._lock:
+            now = self._timestamp()
+            cancelled = [
+                job
+                for job in self._jobs.values()
+                if _job_chart_id(job) == chart_id
+                and job.status in {"queued", "leased", "failed"}
+            ]
+            for job in cancelled:
+                job.status = "cancelled"
+                job.lease = None
+                job.error = None
+                job.updated_at = now
+            if cancelled:
+                self._save_locked()
+            return sorted(cancelled, key=lambda job: job.sequence)
+
+    def retry_chart(self, chart_id: str) -> List[ProgressiveJob]:
+        """Requeue failed or cancelled work at its original priority."""
+
+        chart_id = _chart_identifier(chart_id)
+        with self._lock:
+            now = self._timestamp()
+            retried = [
+                job
+                for job in self._jobs.values()
+                if _job_chart_id(job) == chart_id
+                and job.status in {"failed", "cancelled"}
+            ]
+            for job in retried:
+                job.status = "queued"
+                job.lease = None
+                job.error = None
+                job.attempts = 0
+                job.updated_at = now
+            if retried:
+                self._save_locked()
+            return sorted(retried, key=lambda job: job.priority)
+
+    def clear_history(self, chart_id: Optional[str] = None) -> List[str]:
+        """Remove failed and cancelled history for one chart or all charts."""
+
+        normalized = _chart_identifier(chart_id) if chart_id is not None else None
+        with self._lock:
+            job_ids = [
+                job.id
+                for job in self._jobs.values()
+                if job.status in {"failed", "cancelled"}
+                and (normalized is None or _job_chart_id(job) == normalized)
+            ]
+            self._remove_jobs_locked(job_ids)
+            if job_ids:
+                self._save_locked()
+            return job_ids
+
+    def clear_chart_history(self, chart_id: str) -> List[str]:
+        return self.clear_history(chart_id)
+
+    def remove_chart(self, chart_id: str) -> List[str]:
+        """Remove every queued and historical job for a deleted chart."""
+
+        chart_id = _chart_identifier(chart_id)
+        with self._lock:
+            job_ids = [
+                job.id for job in self._jobs.values() if _job_chart_id(job) == chart_id
+            ]
+            was_paused = chart_id in self._paused_charts
+            self._paused_charts.discard(chart_id)
+            self._remove_jobs_locked(job_ids)
+            if job_ids or was_paused:
+                self._save_locked()
+            return job_ids
+
     def get(self, job_id: str) -> Optional[ProgressiveJob]:
         with self._lock:
             return self._jobs.get(job_id)
@@ -451,6 +566,16 @@ class ProgressiveQueue:
                 (job for job in self._jobs.values() if job.status == "queued"),
                 key=lambda job: job.priority,
             )
+
+    def _job_is_paused(self, job: ProgressiveJob) -> bool:
+        chart_id = _job_chart_id(job)
+        return chart_id is not None and chart_id in self._paused_charts
+
+    def _remove_jobs_locked(self, job_ids: Iterable[str]) -> None:
+        for job_id in job_ids:
+            job = self._jobs.pop(job_id, None)
+            if job is not None:
+                self._by_key.pop(job.key.canonical, None)
 
     def _leased_job(self, job_id: str, lease_token: str) -> ProgressiveJob:
         try:
@@ -494,8 +619,10 @@ class ProgressiveQueue:
                 by_key = {job.key.canonical: job.id for job in loaded}
                 if len(by_key) != len(loaded):
                     raise QueueError("queue state contains duplicate job keys")
+                paused_charts = _paused_chart_ids(raw.get("paused_charts", []))
                 self._jobs = by_id
                 self._by_key = by_key
+                self._paused_charts = paused_charts
                 stored_next = int(raw.get("next_sequence", 0))
                 minimum_next = max((job.sequence for job in loaded), default=-1) + 1
                 self._next_sequence = max(stored_next, minimum_next)
@@ -507,6 +634,7 @@ class ProgressiveQueue:
         payload = {
             "version": STATE_VERSION,
             "next_sequence": self._next_sequence,
+            "paused_charts": sorted(self._paused_charts),
             "jobs": [job.to_dict() for job in self.jobs()],
         }
         data = _json_bytes(payload)
@@ -563,7 +691,7 @@ def _spatial_priority(job: ProgressiveJob) -> Tuple[int, int, int]:
 
 def _validate_job(job: ProgressiveJob) -> None:
     _validate_priority(PriorityClass(job.priority_class), job.zoom_distance, job.ring)
-    if job.status not in {"queued", "leased", "complete", "failed"}:
+    if job.status not in {"queued", "leased", "complete", "failed", "cancelled"}:
         raise ValueError("invalid job status")
     if job.chart_state not in {"pending", "preview", "refined"}:
         raise ValueError("invalid chart state")
@@ -592,6 +720,23 @@ def _mapping(value: Any) -> Mapping[str, Any]:
     if not isinstance(value, Mapping):
         raise TypeError("expected a JSON object")
     return value
+
+
+def _chart_identifier(value: object) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise InvalidJob("chart_id must be a nonempty string")
+    return value.strip()
+
+
+def _job_chart_id(job: ProgressiveJob) -> Optional[str]:
+    value = job.metadata.get("chart_id")
+    return value.strip() if isinstance(value, str) and value.strip() else None
+
+
+def _paused_chart_ids(value: object) -> Set[str]:
+    if not isinstance(value, list):
+        raise TypeError("paused_charts must be a JSON list")
+    return {_chart_identifier(item) for item in value}
 
 
 def _present(value: object) -> bool:
