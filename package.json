@@ -1,6 +1,6 @@
 {
   "name": "signalk-charts-provider-progressive",
-  "version": "0.3.8",
+  "version": "0.3.9",
   "description": "Local-first progressive NOAA vector chart provider for Signal K",
   "license": "MIT",
   "main": "index.js",

@@ -199,6 +199,21 @@ class ProgressiveQueueTest(unittest.TestCase):
         with self.assertRaises(LeaseConflict):
             reloaded.fail(job.id, leased.lease.token, "late result")
 
+    def test_local_leases_are_reclaimed_immediately_after_restart(self):
+        local = self.queue.enqueue_cell("noaa", "US5OAKIK")
+        remote = self.queue.enqueue_cell("noaa", "US5OAKIJ")
+        local_lease = self.queue.lease_next("local-old", worker_kind="local")
+        remote_lease = self.queue.lease_next("workstation", worker_kind="remote")
+        self.assertEqual(local.id, local_lease.id)
+        self.assertEqual(remote.id, remote_lease.id)
+
+        restarted = ProgressiveQueue(self.path, lease_seconds=30, clock=self.clock)
+        reclaimed = restarted.reclaim_worker_kind("local")
+
+        self.assertEqual([local.id], [job.id for job in reclaimed])
+        self.assertEqual("queued", restarted.get(local.id).status)
+        self.assertEqual("leased", restarted.get(remote.id).status)
+
     def test_cell_and_packet_namespaces_do_not_collide(self):
         cell = self.queue.enqueue(JobKey.for_cell("packet", "profile"))
         packet = self.queue.enqueue(JobKey.for_packet("packet", "profile", "1"))

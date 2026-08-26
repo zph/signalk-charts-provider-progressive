@@ -48,7 +48,7 @@ from pydantic import BaseModel, Field, field_validator
 from progressive_queue import PriorityClass, ProgressiveJob, ProgressiveQueue
 from progressive_provider import ArtifactNotFound, ArtifactRegistry, InvalidArtifact, TileResponse
 
-APP_VERSION = "0.3.8"
+APP_VERSION = "0.3.9"
 NOAA_CATALOG_URL = "https://www.charts.noaa.gov/InteractiveCatalog/data/enc.geojson"
 NOAA_ENC_BASE_URL = "https://charts.noaa.gov/ENCs"
 TOOLBOX_IMAGE = "ghcr.io/dirkwa/signalk-charts-provider-simple/charts-toolbox:1.1.0"
@@ -1016,6 +1016,7 @@ class ProgressiveController:
         self.catalog = catalog
         self.builder = builder
         self.queue = ProgressiveQueue(self.data_dir / "queue.json", lease_seconds=180)
+        self.queue.reclaim_worker_kind("local")
         self.registry = ArtifactRegistry(
             self.data_dir / "provider.json", self.data_dir / "artifacts"
         )

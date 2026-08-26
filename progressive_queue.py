@@ -441,6 +441,26 @@ class ProgressiveQueue:
                 self._save_locked()
             return expired
 
+    def reclaim_worker_kind(self, worker_kind: str) -> List[ProgressiveJob]:
+        """Requeue leases owned by workers that cannot survive this process restart."""
+
+        if not _present(worker_kind):
+            raise ValueError("worker_kind is required")
+        with self._lock:
+            now = self._clock()
+            reclaimed = [
+                job
+                for job in self._jobs.values()
+                if job.status == "leased"
+                and job.lease is not None
+                and job.lease.worker_kind == worker_kind
+            ]
+            for job in reclaimed:
+                self._requeue_one(job, now)
+            if reclaimed:
+                self._save_locked()
+            return sorted(reclaimed, key=lambda job: job.priority)
+
     def pause_chart(self, chart_id: str) -> bool:
         """Pause new leases for a chart without disturbing active workers."""
 
