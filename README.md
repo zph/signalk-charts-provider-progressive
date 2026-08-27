@@ -17,6 +17,8 @@ A workstation is never required. The Raspberry Pi can complete every queued task
 
 Each publication is an immutable MBTiles generation. Signal K chart URLs include the generation, preventing Freeboard, Binnacle, or the browser cache from retaining provisional tiles after refinement.
 
+The coverage search suggests individual ENC cells, NOAA's named state packages, and useful major aggregates such as West Coast, Pacific Northwest, Gulf Coast, East Coast, and Great Lakes. Choosing a region opens a confirmation with its approach-cell count; confirming replaces the current selection, fits the map to the region, and names the chart set. The provider still resolves the matching coastal and harbor cells automatically when the build starts.
+
 The coverage selector draws NOAA ENC Online's rendered chart beneath the selectable ENC cell boundaries. OpenStreetMap remains underneath as a geographic fallback while NOAA is loading or unavailable. If both online map sources are unavailable, the selector retains a coordinate grid so downloaded catalog coverage can still be selected.
 
 The live path remains vector throughout:

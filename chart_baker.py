@@ -48,7 +48,7 @@ from pydantic import BaseModel, Field, field_validator
 from progressive_queue import PriorityClass, ProgressiveJob, ProgressiveQueue
 from progressive_provider import ArtifactNotFound, ArtifactRegistry, InvalidArtifact, TileResponse
 
-APP_VERSION = "0.3.11"
+APP_VERSION = "0.3.12"
 NOAA_CATALOG_URL = "https://www.charts.noaa.gov/InteractiveCatalog/data/enc.geojson"
 NOAA_ENC_BASE_URL = "https://charts.noaa.gov/ENCs"
 TOOLBOX_IMAGE = "ghcr.io/dirkwa/signalk-charts-provider-simple/charts-toolbox:1.1.0"
@@ -179,6 +179,95 @@ BASIC_S57_LAYERS = (
     "BOYLAT",
     "BCNLAT",
     "LIGHTS",
+)
+
+NOAA_STATE_REGION_NAMES = {
+    "AK": "Alaska",
+    "AL": "Alabama",
+    "AS": "American Samoa",
+    "CA": "California",
+    "CT": "Connecticut",
+    "DE": "Delaware",
+    "FL": "Florida",
+    "FM": "Federated States of Micronesia",
+    "GA": "Georgia",
+    "GU": "Guam",
+    "HI": "Hawaii",
+    "IL": "Illinois",
+    "IN": "Indiana",
+    "LA": "Louisiana",
+    "MA": "Massachusetts",
+    "MD": "Maryland",
+    "ME": "Maine",
+    "MH": "Marshall Islands",
+    "MI": "Michigan",
+    "MN": "Minnesota",
+    "MP": "Northern Mariana Islands",
+    "MS": "Mississippi",
+    "NC": "North Carolina",
+    "NH": "New Hampshire",
+    "NJ": "New Jersey",
+    "NY": "New York",
+    "OH": "Ohio",
+    "OR": "Oregon",
+    "PA": "Pennsylvania",
+    "PR": "Puerto Rico",
+    "PW": "Palau",
+    "RI": "Rhode Island",
+    "SC": "South Carolina",
+    "TX": "Texas",
+    "VA": "Virginia",
+    "VI": "U.S. Virgin Islands",
+    "WA": "Washington",
+    "WI": "Wisconsin",
+}
+
+NOAA_MAJOR_REGIONS = (
+    (
+        "west-coast",
+        "West Coast",
+        ("CA", "OR", "WA"),
+        "California, Oregon, and Washington NOAA state packages",
+    ),
+    (
+        "pacific-northwest",
+        "Pacific Northwest",
+        ("OR", "WA"),
+        "Oregon and Washington NOAA state packages",
+    ),
+    (
+        "gulf-coast",
+        "Gulf Coast",
+        ("TX", "LA", "MS", "AL", "FL"),
+        "Texas through Florida NOAA state packages",
+    ),
+    (
+        "east-coast",
+        "East Coast",
+        (
+            "FL",
+            "GA",
+            "SC",
+            "NC",
+            "VA",
+            "MD",
+            "DE",
+            "NJ",
+            "NY",
+            "CT",
+            "RI",
+            "MA",
+            "NH",
+            "ME",
+        ),
+        "Florida through Maine NOAA state packages",
+    ),
+    (
+        "great-lakes",
+        "Great Lakes",
+        ("MN", "WI", "IL", "IN", "MI", "OH", "PA", "NY"),
+        "NOAA state packages bordering the Great Lakes",
+    ),
 )
 
 
@@ -323,6 +412,62 @@ class Footprint:
     scale: int | None
     title: str
     bbox: list[float]
+
+
+@dataclass(slots=True)
+class CatalogRegion:
+    id: str
+    name: str
+    kind: str
+    description: str
+    chart_ids: list[str]
+    bounds: list[float]
+
+
+def catalog_regions(entries: Iterable[Footprint]) -> list[CatalogRegion]:
+    """Build searchable regions from NOAA's band-4 state package codes."""
+    by_state: dict[str, list[Footprint]] = {}
+    for entry in entries:
+        if entry.band != 4 or not re.fullmatch(r"US4[A-Z0-9]{5}", entry.chart_id):
+            continue
+        state_code = entry.chart_id[3:5]
+        if state_code in NOAA_STATE_REGION_NAMES:
+            by_state.setdefault(state_code, []).append(entry)
+
+    regions: list[CatalogRegion] = []
+    for region_id, name, state_codes, description in NOAA_MAJOR_REGIONS:
+        members = sorted(
+            (item for code in state_codes for item in by_state.get(code, [])),
+            key=lambda item: item.chart_id,
+        )
+        if members:
+            regions.append(
+                CatalogRegion(
+                    id=region_id,
+                    name=name,
+                    kind="Regional aggregate",
+                    description=description,
+                    chart_ids=[item.chart_id for item in members],
+                    bounds=bounds_for(members),
+                )
+            )
+
+    for state_code, members in sorted(
+        by_state.items(), key=lambda item: NOAA_STATE_REGION_NAMES[item[0]]
+    ):
+        name = NOAA_STATE_REGION_NAMES[state_code]
+        ordered = sorted(members, key=lambda item: item.chart_id)
+        regions.append(
+            CatalogRegion(
+                id=f"state-{state_code.lower()}",
+                name=name,
+                kind="NOAA state package",
+                description=f"NOAA ENCs by State coverage for {name}",
+                chart_ids=[item.chart_id for item in ordered],
+                bounds=bounds_for(ordered),
+            )
+        )
+    return regions
 
 
 class Catalog:
@@ -1848,9 +1993,11 @@ def create_app(data_dir: Path = DEFAULT_DATA_DIR, runtime: str = "auto") -> Fast
     def noaa_catalog(refresh: bool = False) -> dict[str, Any]:
         try:
             entries = catalog.band4() if not refresh else sorted((x for x in catalog.load(True) if x.band == 4), key=lambda x: x.chart_id)
+            regions = catalog_regions(entries)
             return {
                 "entries": [asdict(item) for item in entries],
                 "presets": {"california": [item.chart_id for item in entries if item.chart_id.startswith("US4CA")]},
+                "regions": [asdict(region) for region in regions],
             }
         except Exception as error:
             raise HTTPException(502, str(error)) from error
@@ -1992,13 +2139,14 @@ UI_HTML = r'''<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Charts Provider Progressive</title>
 <style>
-:root{color-scheme:dark;--bg:#07131a;--panel:#0d2029;--line:#22414d;--ink:#ecf7f5;--muted:#91aab1;--sea:#0a2734;--cyan:#50d6ca;--lime:#c5ed72;--amber:#ffc56e;--red:#ff766f}*{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at 65% -10%,#123949 0,transparent 38%),var(--bg);color:var(--ink);font:15px/1.45 ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}button,input,textarea,select{font:inherit}button{cursor:pointer}header{padding:28px clamp(18px,4vw,54px) 20px;display:flex;gap:20px;align-items:end;justify-content:space-between}h1{margin:0;font-size:clamp(28px,4vw,48px);letter-spacing:-.04em}.eyebrow{color:var(--cyan);text-transform:uppercase;letter-spacing:.14em;font-size:12px;font-weight:800}.lede{margin:7px 0 0;color:var(--muted);max-width:720px}.status{border:1px solid var(--line);background:#0a1a21;padding:9px 13px;border-radius:999px;white-space:nowrap}.status.good{color:var(--lime)}main{padding:0 clamp(18px,4vw,54px) 48px;display:grid;grid-template-columns:minmax(0,1.7fr) minmax(320px,.8fr);gap:20px}.panel{background:color-mix(in srgb,var(--panel) 94%,transparent);border:1px solid var(--line);border-radius:18px;overflow:hidden;box-shadow:0 18px 50px #0005}.panel-head{padding:18px 20px;border-bottom:1px solid var(--line);display:flex;align-items:center;justify-content:space-between;gap:12px}.panel-head h2,.form h3{margin:0;font-size:17px}.count{color:var(--muted);font-variant-numeric:tabular-nums}.map-wrap{position:relative;height:min(58vh,620px);min-height:420px;background:var(--sea)}canvas{width:100%;height:100%;display:block;touch-action:none}.map-tools{position:absolute;top:12px;left:12px;right:12px;display:flex;gap:8px;pointer-events:none}.map-tools>*{pointer-events:auto}.map-attribution{position:absolute;left:9px;bottom:8px;padding:3px 7px;border-radius:5px;background:#07131acc;color:#d8e5e3;font-size:10px;line-height:1.25}.map-attribution a{color:inherit}.search{flex:1;min-width:0}.field,textarea,select{width:100%;border:1px solid var(--line);background:#081920;color:var(--ink);border-radius:10px;padding:10px 12px;outline:none}.field:focus,textarea:focus,select:focus{border-color:var(--cyan);box-shadow:0 0 0 3px #50d6ca22}.btn{border:1px solid var(--line);background:#112b35;color:var(--ink);padding:10px 13px;border-radius:10px;font-weight:750}.btn:hover{border-color:#3a6573}.btn.primary{background:var(--cyan);border-color:var(--cyan);color:#041315}.btn.accent{background:var(--lime);border-color:var(--lime);color:#101904}.btn.danger{color:var(--red)}.forms{display:grid;grid-template-columns:1fr 1fr;border-top:1px solid var(--line)}.form{padding:18px 20px}.form+.form{border-left:1px solid var(--line)}label{display:block;margin:12px 0 5px;color:var(--muted);font-size:12px;font-weight:750}.row{display:grid;grid-template-columns:1fr 1fr;gap:10px}.hint{color:var(--muted);font-size:12px;margin:8px 0}.aside{display:flex;flex-direction:column;min-height:660px}.jobs{padding:12px;display:flex;flex-direction:column;gap:10px;overflow:auto;max-height:calc(100vh - 150px)}.job{border:1px solid var(--line);border-radius:13px;background:#091a21;padding:13px}.job-top{display:flex;justify-content:space-between;gap:12px}.job-title{font-weight:800}.job-phase{color:var(--muted);font-size:12px;margin:3px 0 9px}.badge{font-size:11px;text-transform:uppercase;letter-spacing:.08em;color:var(--amber)}.badge.completed,.badge.ready,.badge.preview{color:var(--lime)}.badge.failed,.badge.cancelled{color:var(--red)}.badge.paused{color:var(--cyan)}progress{width:100%;height:7px;accent-color:var(--cyan)}details{margin-top:9px}summary{color:var(--muted);font-size:12px;cursor:pointer}pre{white-space:pre-wrap;word-break:break-word;background:#041016;border-radius:8px;padding:9px;max-height:180px;overflow:auto;font:11px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace}.actions{display:flex;gap:7px;flex-wrap:wrap;margin-top:9px}.actions .btn{padding:6px 9px;font-size:12px}.empty{padding:30px 18px;color:var(--muted);text-align:center}.note{padding:12px 20px;border-top:1px solid var(--line);color:var(--muted);font-size:12px}dialog{border:1px solid var(--line);background:var(--panel);color:var(--ink);border-radius:16px;width:min(460px,calc(100vw - 30px));padding:20px}dialog::backdrop{background:#000a}.error{color:var(--red)}@media(max-width:920px){main{grid-template-columns:1fr}.aside{min-height:400px}.jobs{max-height:600px}}@media(max-width:650px){header{align-items:start;flex-direction:column}.forms{grid-template-columns:1fr}.form+.form{border-left:0;border-top:1px solid var(--line)}.map-wrap{min-height:360px}.map-tools{flex-wrap:wrap}.search{flex-basis:100%}}
+:root{color-scheme:dark;--bg:#07131a;--panel:#0d2029;--line:#22414d;--ink:#ecf7f5;--muted:#91aab1;--sea:#0a2734;--cyan:#50d6ca;--lime:#c5ed72;--amber:#ffc56e;--red:#ff766f}*{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at 65% -10%,#123949 0,transparent 38%),var(--bg);color:var(--ink);font:15px/1.45 ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}button,input,textarea,select{font:inherit}button{cursor:pointer}header{padding:28px clamp(18px,4vw,54px) 20px;display:flex;gap:20px;align-items:end;justify-content:space-between}h1{margin:0;font-size:clamp(28px,4vw,48px);letter-spacing:-.04em}.eyebrow{color:var(--cyan);text-transform:uppercase;letter-spacing:.14em;font-size:12px;font-weight:800}.lede{margin:7px 0 0;color:var(--muted);max-width:720px}.status{border:1px solid var(--line);background:#0a1a21;padding:9px 13px;border-radius:999px;white-space:nowrap}.status.good{color:var(--lime)}main{padding:0 clamp(18px,4vw,54px) 48px;display:grid;grid-template-columns:minmax(0,1.7fr) minmax(320px,.8fr);gap:20px}.panel{background:color-mix(in srgb,var(--panel) 94%,transparent);border:1px solid var(--line);border-radius:18px;overflow:hidden;box-shadow:0 18px 50px #0005}.panel-head{padding:18px 20px;border-bottom:1px solid var(--line);display:flex;align-items:center;justify-content:space-between;gap:12px}.panel-head h2,.form h3{margin:0;font-size:17px}.count{color:var(--muted);font-variant-numeric:tabular-nums}.map-wrap{position:relative;height:min(58vh,620px);min-height:420px;background:var(--sea)}canvas{width:100%;height:100%;display:block;touch-action:none}.map-tools{position:absolute;top:12px;left:12px;right:12px;display:flex;gap:8px;pointer-events:none}.map-tools>*{pointer-events:auto}.map-attribution{position:absolute;left:9px;bottom:8px;padding:3px 7px;border-radius:5px;background:#07131acc;color:#d8e5e3;font-size:10px;line-height:1.25}.map-attribution a{color:inherit}.search-shell{position:relative;flex:1;min-width:0}.search{width:100%}.search-results{position:absolute;z-index:5;top:calc(100% + 6px);left:0;right:0;max-height:min(390px,55vh);overflow:auto;border:1px solid #3a6573;background:#07171ecc;border-radius:12px;padding:6px;box-shadow:0 18px 45px #0009;backdrop-filter:blur(12px)}.search-results[hidden]{display:none}.search-heading{padding:7px 9px 4px;color:var(--cyan);font-size:11px;font-weight:800;letter-spacing:.08em;text-transform:uppercase}.search-option{display:block;width:100%;border:0;background:transparent;color:var(--ink);padding:9px;border-radius:8px;text-align:left}.search-option:hover,.search-option:focus{background:#173642;outline:none}.search-option strong,.search-option span{display:block}.search-option span{color:var(--muted);font-size:12px}.field,textarea,select{width:100%;border:1px solid var(--line);background:#081920;color:var(--ink);border-radius:10px;padding:10px 12px;outline:none}.field:focus,textarea:focus,select:focus{border-color:var(--cyan);box-shadow:0 0 0 3px #50d6ca22}.btn{border:1px solid var(--line);background:#112b35;color:var(--ink);padding:10px 13px;border-radius:10px;font-weight:750}.btn:hover{border-color:#3a6573}.btn.primary{background:var(--cyan);border-color:var(--cyan);color:#041315}.btn.accent{background:var(--lime);border-color:var(--lime);color:#101904}.btn.danger{color:var(--red)}.forms{display:grid;grid-template-columns:1fr 1fr;border-top:1px solid var(--line)}.form{padding:18px 20px}.form+.form{border-left:1px solid var(--line)}label{display:block;margin:12px 0 5px;color:var(--muted);font-size:12px;font-weight:750}.row{display:grid;grid-template-columns:1fr 1fr;gap:10px}.hint{color:var(--muted);font-size:12px;margin:8px 0}.aside{display:flex;flex-direction:column;min-height:660px}.jobs{padding:12px;display:flex;flex-direction:column;gap:10px;overflow:auto;max-height:calc(100vh - 150px)}.job{border:1px solid var(--line);border-radius:13px;background:#091a21;padding:13px}.job-top{display:flex;justify-content:space-between;gap:12px}.job-title{font-weight:800}.job-phase{color:var(--muted);font-size:12px;margin:3px 0 9px}.badge{font-size:11px;text-transform:uppercase;letter-spacing:.08em;color:var(--amber)}.badge.completed,.badge.ready,.badge.preview{color:var(--lime)}.badge.failed,.badge.cancelled{color:var(--red)}.badge.paused{color:var(--cyan)}progress{width:100%;height:7px;accent-color:var(--cyan)}details{margin-top:9px}summary{color:var(--muted);font-size:12px;cursor:pointer}pre{white-space:pre-wrap;word-break:break-word;background:#041016;border-radius:8px;padding:9px;max-height:180px;overflow:auto;font:11px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace}.actions{display:flex;gap:7px;flex-wrap:wrap;margin-top:9px}.actions .btn{padding:6px 9px;font-size:12px}.empty{padding:30px 18px;color:var(--muted);text-align:center}.note{padding:12px 20px;border-top:1px solid var(--line);color:var(--muted);font-size:12px}dialog{border:1px solid var(--line);background:var(--panel);color:var(--ink);border-radius:16px;width:min(460px,calc(100vw - 30px));padding:20px}dialog::backdrop{background:#000a}.dialog-summary{font-size:18px;font-weight:800}.error{color:var(--red)}@media(max-width:920px){main{grid-template-columns:1fr}.aside{min-height:400px}.jobs{max-height:600px}}@media(max-width:650px){header{align-items:start;flex-direction:column}.forms{grid-template-columns:1fr}.form+.form{border-left:0;border-top:1px solid var(--line)}.map-wrap{min-height:360px}.map-tools{flex-wrap:wrap}.search-shell{flex-basis:100%}}
 </style></head><body>
 <header><div><div class="eyebrow">Local-first progressive charts</div><h1>Charts Provider Progressive</h1><p class="lede">Select NOAA ENC coverage, publish the current view quickly, then improve zoom levels, nearby coverage, and full fidelity in the background.</p></div><div id="runtime" class="status">Checking runtime…</div></header>
-<main><section class="panel"><div class="panel-head"><h2>NOAA ENC coverage</h2><span id="selectionCount" class="count">Loading catalog…</span></div><div class="map-wrap"><canvas id="map" aria-label="Interactive NOAA ENC coverage map"></canvas><div class="map-tools"><input id="search" class="field search" placeholder="Find chart id or place"><button class="btn" id="california">California preset</button><button class="btn" id="clear">Clear</button></div><div class="map-attribution"><a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">© OpenStreetMap contributors</a><span id="mapStatus"> · NOAA ENC Online</span></div></div><div class="forms"><form class="form" id="noaaForm"><h3>Start progressive chart</h3><label for="noaaName">Chart set name</label><input class="field" id="noaaName" value="NOAA ENC California" required><div class="row"><div><label for="minZoom">Minimum zoom</label><input class="field" id="minZoom" type="number" min="0" max="18" value="4"></div><div><label for="maxZoom">Maximum zoom</label><input class="field" id="maxZoom" type="number" min="0" max="18" value="16"></div></div><div class="row"><div><label for="parallelism">Local CPU workers</label><input class="field" id="parallelism" type="number" min="1" max="32" value="1"></div><div><label for="profile">Layer profile</label><select id="profile"><option value="compatible">Compatible portrayal</option><option value="full">Full S-57</option></select></div></div><p class="hint">The visible map view is built first. Adjacent zooms, surrounding coverage, the selected region, and the refined chart follow automatically. A future release can expose individual layer selection.</p><button class="btn primary" type="submit">Start progressive chart</button></form><form class="form" id="urlForm"><h3>Build from links</h3><label for="urlName">Chart set name</label><input class="field" id="urlName" value="Imported charts" required><label for="urls">Direct chart links, one per line</label><textarea id="urls" rows="5" placeholder="https://…/enc.zip&#10;https://…/chart.mbtiles"></textarea><p class="hint">Linked-file conversion remains available as a batch operation. Progressive NOAA charts are always built by the local worker and published as soon as each generation is ready.</p><button class="btn" type="submit">Build linked files</button></form></div><div class="note">Navigation warning: generated charts are supplemental and must not be your sole means of navigation.</div></section><aside class="panel aside"><div class="panel-head"><h2>Build queue</h2><button class="btn" id="refreshJobs">Refresh</button></div><div id="jobs" class="jobs"><div class="empty">No builds yet.</div></div></aside></main>
+<main><section class="panel"><div class="panel-head"><h2>NOAA ENC coverage</h2><span id="selectionCount" class="count">Loading catalog…</span></div><div class="map-wrap"><canvas id="map" aria-label="Interactive NOAA ENC coverage map"></canvas><div class="map-tools"><div class="search-shell"><input id="search" class="field search" placeholder="Find a NOAA region, chart id, or place" role="combobox" aria-autocomplete="list" aria-controls="searchResults" aria-expanded="false" autocomplete="off" disabled><div id="searchResults" class="search-results" role="listbox" hidden></div></div><button class="btn" id="browseRegions" disabled>Browse regions</button><button class="btn" id="clear">Clear</button></div><div class="map-attribution"><a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">© OpenStreetMap contributors</a><span id="mapStatus"> · NOAA ENC Online</span></div></div><div class="forms"><form class="form" id="noaaForm"><h3>Start progressive chart</h3><label for="noaaName">Chart set name</label><input class="field" id="noaaName" value="NOAA ENC California" required><div class="row"><div><label for="minZoom">Minimum zoom</label><input class="field" id="minZoom" type="number" min="0" max="18" value="4"></div><div><label for="maxZoom">Maximum zoom</label><input class="field" id="maxZoom" type="number" min="0" max="18" value="16"></div></div><div class="row"><div><label for="parallelism">Local CPU workers</label><input class="field" id="parallelism" type="number" min="1" max="32" value="1"></div><div><label for="profile">Layer profile</label><select id="profile"><option value="compatible">Compatible portrayal</option><option value="full">Full S-57</option></select></div></div><p class="hint">Search for a NOAA state package or major region, confirm its coverage, and the required approach cells are selected automatically. The visible map view is built first; adjacent zooms and refined coverage follow.</p><button class="btn primary" type="submit">Start progressive chart</button></form><form class="form" id="urlForm"><h3>Build from links</h3><label for="urlName">Chart set name</label><input class="field" id="urlName" value="Imported charts" required><label for="urls">Direct chart links, one per line</label><textarea id="urls" rows="5" placeholder="https://…/enc.zip&#10;https://…/chart.mbtiles"></textarea><p class="hint">Linked-file conversion remains available as a batch operation. Progressive NOAA charts are always built by the local worker and published as soon as each generation is ready.</p><button class="btn" type="submit">Build linked files</button></form></div><div class="note">Navigation warning: generated charts are supplemental and must not be your sole means of navigation.</div></section><aside class="panel aside"><div class="panel-head"><h2>Build queue</h2><button class="btn" id="refreshJobs">Refresh</button></div><div id="jobs" class="jobs"><div class="empty">No builds yet.</div></div></aside></main>
+<dialog id="regionDialog" aria-labelledby="regionTitle"><form method="dialog"><h2 id="regionTitle">Select NOAA region</h2><p id="regionDescription" class="hint"></p><p id="regionCount" class="dialog-summary"></p><p class="hint">This replaces the current map selection. NOAA coastal and harbor cells needed for the selected approach coverage are resolved automatically when the chart build starts.</p><div class="actions"><button class="btn accent" id="confirmRegion" value="confirm">Confirm region</button><button class="btn" value="cancel">Cancel</button></div></form></dialog>
 <dialog id="sideloadDialog"><form method="dialog" id="sideloadForm"><h2>Send to Signal K</h2><input type="hidden" id="sideloadJob"><label for="sshTarget">SSH target</label><input class="field" id="sshTarget" value="boat-pi"><label for="destination">Chart consumer</label><select id="destination"><option value="auto">Auto: S-57 MBTiles (recommended)</option><option value="freeboard">Freeboard and Binnacle S-57 via Charts Provider Simple</option><option value="chart-locker">Chart Locker PMTiles (generic vector or raster)</option><option value="both">Both destinations</option></select><label for="mbtilesDir">Charts Provider Simple folder</label><input class="field" id="mbtilesDir" value="/home/signalk/.signalk/charts-simple"><label for="pmtilesDir">Chart Locker PMTiles folder</label><input class="field" id="pmtilesDir" value="/home/signalk/.signalk/charts/pmtiles"><label for="remoteOwner">Remote owner</label><input class="field" id="remoteOwner" value="signalk:signalk"><label><input id="restartSignalk" type="checkbox" checked> Restart Signal K after transfer</label><p class="hint">Auto sends S-57 MBTiles through the provider that advertises <code>type: S-57</code>. Current Freeboard and Binnacle releases portray this vector format. Files are checksum-verified and moved into place atomically.</p><p id="sideloadError" class="error"></p><div class="actions"><button class="btn accent" value="send">Send files</button><button class="btn" value="cancel">Cancel</button></div></form></dialog>
 <script>
-const $=s=>document.querySelector(s),NOAA_WMS_URL='https://gis.charttools.noaa.gov/arcgis/rest/services/MCS/ENCOnline/MapServer/exts/MaritimeChartService/WMSServer',NOAA_WMS_LAYERS='0,1,2,3,4,5,6,7,8,9,10,11,12',OPEN_MAP_TILE_URL='https://tile.openstreetmap.org',WEB_MERCATOR_RADIUS=6378137,state={entries:[],selected:new Set(),presets:{},view:{lon:-119,lat:37,scale:10},drag:null,openMapTiles:[],openMapRequest:0,basemap:null,basemapRequest:0,basemapTimer:null};
+const $=s=>document.querySelector(s),NOAA_WMS_URL='https://gis.charttools.noaa.gov/arcgis/rest/services/MCS/ENCOnline/MapServer/exts/MaritimeChartService/WMSServer',NOAA_WMS_LAYERS='0,1,2,3,4,5,6,7,8,9,10,11,12',OPEN_MAP_TILE_URL='https://tile.openstreetmap.org',WEB_MERCATOR_RADIUS=6378137,state={entries:[],regions:[],selected:new Set(),selectionLabel:'',pendingRegion:null,view:{lon:-119,lat:37,scale:10},drag:null,openMapTiles:[],openMapRequest:0,basemap:null,basemapRequest:0,basemapTimer:null};
 const canvas=$('#map'),ctx=canvas.getContext('2d');
 function mercatorY(lat){const radians=Math.max(-85,Math.min(85,lat))*Math.PI/180;return Math.log(Math.tan(Math.PI/4+radians/2))*180/Math.PI}
 function latitudeFromMercator(y){return Math.max(-85,Math.min(85,(2*Math.atan(Math.exp(y*Math.PI/180))-Math.PI/2)*180/Math.PI))}
@@ -2016,13 +2164,20 @@ function tileY(lat,z){const radians=Math.max(-85,Math.min(85,lat))*Math.PI/180;r
 function scheduleBasemap(){clearTimeout(state.basemapTimer);state.basemapTimer=setTimeout(()=>{loadOpenMap();loadBasemap()},220)}
 function loadOpenMap(){const bounds=viewportBounds(),z=Math.max(2,Math.min(15,currentZoom())),n=2**z,minX=Math.max(0,tileX(bounds[0],z)),maxX=Math.min(n-1,tileX(bounds[2],z)),minY=Math.max(0,tileY(bounds[3],z)),maxY=Math.min(n-1,tileY(bounds[1],z)),request=++state.openMapRequest,tiles=[];state.openMapTiles=[];for(let x=minX;x<=maxX;x++)for(let y=minY;y<=maxY;y++){const image=new Image(),tile={image,bounds:[tileLongitude(x,z),tileLatitude(y+1,z),tileLongitude(x+1,z),tileLatitude(y,z)]};image.crossOrigin='anonymous';image.onload=()=>{if(request!==state.openMapRequest)return;tiles.push(tile);state.openMapTiles=tiles;draw()};image.src=`${OPEN_MAP_TILE_URL}/${z}/${x}/${y}.png`}}
 function loadBasemap(){const bounds=viewportBounds(),r=canvas.getBoundingClientRect(),width=Math.max(256,Math.min(1600,Math.round(r.width))),height=Math.max(256,Math.min(1200,Math.round(r.height))),params=new URLSearchParams({SERVICE:'WMS',VERSION:'1.3.0',REQUEST:'GetMap',LAYERS:NOAA_WMS_LAYERS,STYLES:'',CRS:'EPSG:102100',BBOX:[webMercatorX(bounds[0]),webMercatorY(bounds[1]),webMercatorX(bounds[2]),webMercatorY(bounds[3])].join(','),WIDTH:String(width),HEIGHT:String(height),FORMAT:'image/png',TRANSPARENT:'FALSE'}),image=new Image(),request=++state.basemapRequest;$('#mapStatus').textContent=' · NOAA ENC Online loading';image.onload=()=>{if(request!==state.basemapRequest)return;state.basemap={image,bounds};$('#mapStatus').textContent=' · NOAA ENC Online';draw()};image.onerror=()=>{if(request!==state.basemapRequest)return;state.basemap=null;$('#mapStatus').textContent=' · NOAA unavailable, OpenStreetMap background';draw()};image.src=NOAA_WMS_URL+'?'+params}
-function updateCount(){const n=state.selected.size;$('#selectionCount').textContent=`${n} approach cell${n===1?'':'s'} selected`}
+function updateCount(){const n=state.selected.size;$('#selectionCount').textContent=`${n} approach cell${n===1?'':'s'} selected${state.selectionLabel?` · ${state.selectionLabel}`:''}`}
 function fit(ids){const es=state.entries.filter(e=>ids.has(e.chart_id));if(!es.length)return;let b=[180,90,-180,-90];for(const e of es){b[0]=Math.min(b[0],e.bbox[0]);b[1]=Math.min(b[1],e.bbox[1]);b[2]=Math.max(b[2],e.bbox[2]);b[3]=Math.max(b[3],e.bbox[3])}const r=canvas.getBoundingClientRect(),south=mercatorY(b[1]),north=mercatorY(b[3]);state.view.lon=(b[0]+b[2])/2;state.view.lat=latitudeFromMercator((south+north)/2);state.view.scale=Math.min(r.width/Math.max(1,(b[2]-b[0])*1.15),r.height/Math.max(1,(north-south)*1.15));draw();scheduleBasemap()}
-canvas.addEventListener('pointerdown',e=>{canvas.setPointerCapture(e.pointerId);state.drag={x:e.offsetX,y:e.offsetY,lon:state.view.lon,mercatorLat:mercatorY(state.view.lat),moved:false}});canvas.addEventListener('pointermove',e=>{if(!state.drag)return;const dx=e.offsetX-state.drag.x,dy=e.offsetY-state.drag.y;if(Math.abs(dx)+Math.abs(dy)>4)state.drag.moved=true;state.view.lon=state.drag.lon-dx/state.view.scale;state.view.lat=latitudeFromMercator(state.drag.mercatorLat+dy/state.view.scale);draw()});canvas.addEventListener('pointerup',e=>{if(!state.drag?.moved){const [lon,lat]=unproject(e.offsetX,e.offsetY);const hits=state.entries.filter(x=>lon>=x.bbox[0]&&lon<=x.bbox[2]&&lat>=x.bbox[1]&&lat<=x.bbox[3]);const hit=hits.sort((a,b)=>(a.bbox[2]-a.bbox[0])-(b.bbox[2]-b.bbox[0]))[0];if(hit){state.selected.has(hit.chart_id)?state.selected.delete(hit.chart_id):state.selected.add(hit.chart_id);updateCount();draw()}}else scheduleBasemap();state.drag=null});canvas.addEventListener('wheel',e=>{e.preventDefault();const before=unproject(e.offsetX,e.offsetY);state.view.scale=Math.max(1,Math.min(900,state.view.scale*Math.exp(-e.deltaY*.0015)));const after=unproject(e.offsetX,e.offsetY);state.view.lon+=before[0]-after[0];const adjusted=mercatorY(state.view.lat)+mercatorY(before[1])-mercatorY(after[1]);state.view.lat=latitudeFromMercator(adjusted);draw();scheduleBasemap()},{passive:false});
-$('#clear').onclick=()=>{state.selected.clear();updateCount();draw()};$('#california').onclick=()=>{state.selected=new Set(state.presets.california||[]);updateCount();fit(state.selected)};$('#search').addEventListener('change',e=>{const q=e.target.value.trim().toLowerCase();if(!q)return;const matches=state.entries.filter(x=>x.chart_id.toLowerCase().includes(q)||x.title.toLowerCase().includes(q));if(matches.length){state.selected=new Set(matches.map(x=>x.chart_id));updateCount();fit(state.selected)}});
+canvas.addEventListener('pointerdown',e=>{canvas.setPointerCapture(e.pointerId);state.drag={x:e.offsetX,y:e.offsetY,lon:state.view.lon,mercatorLat:mercatorY(state.view.lat),moved:false}});canvas.addEventListener('pointermove',e=>{if(!state.drag)return;const dx=e.offsetX-state.drag.x,dy=e.offsetY-state.drag.y;if(Math.abs(dx)+Math.abs(dy)>4)state.drag.moved=true;state.view.lon=state.drag.lon-dx/state.view.scale;state.view.lat=latitudeFromMercator(state.drag.mercatorLat+dy/state.view.scale);draw()});canvas.addEventListener('pointerup',e=>{if(!state.drag?.moved){const [lon,lat]=unproject(e.offsetX,e.offsetY);const hits=state.entries.filter(x=>lon>=x.bbox[0]&&lon<=x.bbox[2]&&lat>=x.bbox[1]&&lat<=x.bbox[3]);const hit=hits.sort((a,b)=>(a.bbox[2]-a.bbox[0])-(b.bbox[2]-b.bbox[0]))[0];if(hit){state.selected.has(hit.chart_id)?state.selected.delete(hit.chart_id):state.selected.add(hit.chart_id);state.selectionLabel='';updateCount();draw()}}else scheduleBasemap();state.drag=null});canvas.addEventListener('wheel',e=>{e.preventDefault();const before=unproject(e.offsetX,e.offsetY);state.view.scale=Math.max(1,Math.min(900,state.view.scale*Math.exp(-e.deltaY*.0015)));const after=unproject(e.offsetX,e.offsetY);state.view.lon+=before[0]-after[0];const adjusted=mercatorY(state.view.lat)+mercatorY(before[1])-mercatorY(after[1]);state.view.lat=latitudeFromMercator(adjusted);draw();scheduleBasemap()},{passive:false});
+function closeSearch(){const results=$('#searchResults');results.hidden=true;$('#search').setAttribute('aria-expanded','false')}
+function regionScore(region,q){const name=region.name.toLowerCase();if(name===q)return 0;if(name.startsWith(q))return 1;if(name.includes(q))return 2;if(region.kind.toLowerCase().includes(q))return 3;if(region.description.toLowerCase().includes(q))return 4;return 99}
+function renderSearch(showAll=false){const q=$('#search').value.trim().toLowerCase(),regions=state.regions.map((region,index)=>({region,index,score:showAll||!q?0:regionScore(region,q)})).filter(item=>item.score<99).sort((a,b)=>a.score-b.score||a.index-b.index).slice(0,12).map(item=>item.region),cells=q?state.entries.filter(e=>e.chart_id.toLowerCase().includes(q)||e.title.toLowerCase().includes(q)).slice(0,8):[],parts=[];if(regions.length){parts.push('<div class="search-heading">NOAA regions</div>',...regions.map(r=>`<button class="search-option" type="button" role="option" data-region="${esc(r.id)}"><strong>${esc(r.name)}</strong><span>${esc(r.kind)} · ${r.chart_ids.length} approach cells</span></button>`))}if(cells.length){parts.push('<div class="search-heading">Individual ENC cells</div>',...cells.map(e=>`<button class="search-option" type="button" role="option" data-cell="${esc(e.chart_id)}"><strong>${esc(e.chart_id)}</strong><span>${esc(e.title)}</span></button>`))}const results=$('#searchResults');results.innerHTML=parts.length?parts.join(''):'<div class="empty">No matching NOAA regions or cells.</div>';results.hidden=false;$('#search').setAttribute('aria-expanded','true')}
+function openRegion(region){state.pendingRegion=region;$('#regionTitle').textContent=region.name;$('#regionDescription').textContent=`${region.kind} — ${region.description}`;$('#regionCount').textContent=`Select ${region.chart_ids.length} NOAA approach cells?`;closeSearch();$('#regionDialog').showModal()}
+$('#searchResults').onclick=e=>{const option=e.target.closest('.search-option');if(!option)return;if(option.dataset.region){const region=state.regions.find(r=>r.id===option.dataset.region);if(region)openRegion(region);return}const cell=state.entries.find(item=>item.chart_id===option.dataset.cell);if(cell){state.selected.add(cell.chart_id);state.selectionLabel='';$('#search').value=`${cell.chart_id} — ${cell.title}`;updateCount();fit(new Set([cell.chart_id]));closeSearch()}};
+$('#confirmRegion').onclick=()=>{const region=state.pendingRegion;if(!region)return;state.selected=new Set(region.chart_ids);state.selectionLabel=region.name;$('#search').value=region.name;$('#noaaName').value=`NOAA ENC ${region.name}`;updateCount();fit(state.selected);state.pendingRegion=null;setTimeout(()=>{$('#search').blur();closeSearch()},0)};$('#regionDialog').addEventListener('close',()=>{state.pendingRegion=null});
+$('#search').addEventListener('input',()=>renderSearch(false));$('#search').addEventListener('focus',()=>{if($('#search').value.trim())renderSearch(false)});$('#search').addEventListener('keydown',e=>{if(e.key==='Escape')closeSearch();if(e.key==='ArrowDown'){e.preventDefault();$('#searchResults').querySelector('.search-option')?.focus()}if(e.key==='Enter'){const first=$('#searchResults').querySelector('.search-option');if(first&&!$('#searchResults').hidden){e.preventDefault();first.click()}}});$('#search').addEventListener('blur',()=>setTimeout(()=>{if(!$('#searchResults').contains(document.activeElement))closeSearch()},120));
+$('#browseRegions').onclick=()=>{$('#search').value='';renderSearch(true);$('#search').focus()};$('#clear').onclick=()=>{state.selected.clear();state.selectionLabel='';$('#search').value='';closeSearch();updateCount();draw()};
 const API_BASE=globalThis.CHART_PROVIDER_API_BASE||(location.pathname.startsWith('/plugins/signalk-charts-provider-progressive')?'/plugins/signalk-charts-provider-progressive':'');
 async function api(url,options){const r=await fetch(API_BASE+url,{headers:{'content-type':'application/json'},...options});if(!r.ok){let m=await r.text();try{m=JSON.parse(m).detail}catch{}throw Error(m)}return r.json()}
-async function boot(){const s=await api('/api/status');const rt=$('#runtime');rt.textContent=s.runtime_version||'Docker/Podman unavailable';rt.classList.toggle('good',!!s.runtime);const c=await api('/api/noaa/catalog');state.entries=c.entries;state.presets=c.presets;updateCount();resize();await jobs()}boot().catch(e=>{$('#selectionCount').textContent=e.message});
+async function boot(){const s=await api('/api/status');const rt=$('#runtime');rt.textContent=s.runtime_version||'Docker/Podman unavailable';rt.classList.toggle('good',!!s.runtime);const c=await api('/api/noaa/catalog');state.entries=c.entries;state.regions=c.regions||[];$('#search').disabled=false;$('#browseRegions').disabled=false;updateCount();resize();await jobs()}boot().catch(e=>{$('#selectionCount').textContent=e.message});
 function viewportBounds(){const r=canvas.getBoundingClientRect(),sw=unproject(0,r.height),ne=unproject(r.width,0);return [Math.max(-180,sw[0]),Math.max(-85,sw[1]),Math.min(180,ne[0]),Math.min(85,ne[1])]}
 function currentZoom(){return Math.max(0,Math.min(18,Math.round(Math.log2(state.view.scale*360/256))))}
 $('#noaaForm').onsubmit=async e=>{e.preventDefault();if(!state.selected.size)return alert('Select at least one NOAA approach cell.');try{await api('/api/progressive/noaa',{method:'POST',body:JSON.stringify({name:$('#noaaName').value,chart_ids:[...state.selected],viewport_bbox:viewportBounds(),current_zoom:currentZoom(),min_zoom:+$('#minZoom').value,max_zoom:+$('#maxZoom').value,parallelism:+$('#parallelism').value,download_workers:2,profile:$('#profile').value})});await jobs()}catch(x){alert(x.message)}};
@@ -2062,6 +2217,8 @@ def self_test() -> int:
         "features": [
             feature("US4CA123", 4, -120, "California"),
             feature("US4CA124", 4, -119.5, "Neighbor approach"),
+            feature("US4OR123", 4, -130, "Oregon approach"),
+            feature("US4WA123", 4, -135, "Washington approach"),
             feature("US3CA12M", 3, -120, "Coastal"),
             feature("US5CA12M", 5, -120, "Harbor"),
         ]
@@ -2075,6 +2232,19 @@ def self_test() -> int:
         assert catalog.band4()[0].chart_id == "US4CA123"
         included_ids = {item.chart_id for item in catalog.inclusion(["US4CA123"])}
         assert included_ids == {"US3CA12M", "US4CA123", "US5CA12M"}
+        regions = {region.id: region for region in catalog_regions(catalog.band4())}
+        assert regions["state-ca"].chart_ids == ["US4CA123", "US4CA124"]
+        assert regions["state-ca"].kind == "NOAA state package"
+        assert regions["west-coast"].chart_ids == [
+            "US4CA123",
+            "US4CA124",
+            "US4OR123",
+            "US4WA123",
+        ]
+        assert regions["pacific-northwest"].chart_ids == [
+            "US4OR123",
+            "US4WA123",
+        ]
         manager = JobManager(temp, None, catalog)
         progressive = ProgressiveController(temp, catalog, manager)
         planned = progressive.create(
@@ -2145,6 +2315,9 @@ def self_test() -> int:
         assert "NOAA_WMS_URL" in UI_HTML
         assert "EPSG:102100" in UI_HTML
         assert "tile.openstreetmap.org" in UI_HTML
+        assert 'role="combobox"' in UI_HTML
+        assert 'id="regionDialog"' in UI_HTML
+        assert "Confirm region" in UI_HTML
         archive = temp / "enc.mbtiles"
         with sqlite3.connect(archive) as database:
             database.execute("CREATE TABLE metadata (name TEXT, value TEXT)")
