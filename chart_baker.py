@@ -1202,10 +1202,14 @@ class JobManager:
 class ProgressiveController:
     """Run a durable, local-first preview and refinement queue."""
 
-    def __init__(self, data_dir: Path, catalog: Catalog, builder: JobManager) -> None:
+    def __init__(
+        self, data_dir: Path, catalog: Catalog, builder: JobManager, task_workspace_ttl_days: int = 7
+    ) -> None:
         self.data_dir = data_dir / "progressive"
         self.catalog = catalog
         self.builder = builder
+        self.task_workspace_ttl_seconds = task_workspace_ttl_days * 24 * 60 * 60
+        self.last_task_cleanup = 0.0
         self.queue = ProgressiveQueue(self.data_dir / "queue.json", lease_seconds=180)
         self.queue.reclaim_worker_kind("local")
         self.registry = ArtifactRegistry(
@@ -1222,7 +1226,32 @@ class ProgressiveController:
         )
 
     def start(self) -> None:
+        self.cleanup_expired_task_workspaces()
         self.worker.start()
+
+    def cleanup_expired_task_workspaces(self, now: float | None = None) -> list[str]:
+        """Remove only terminal task workspaces, preserving durable queue history."""
+        if self.task_workspace_ttl_seconds <= 0:
+            return []
+        now = time.time() if now is None else now
+        self.last_task_cleanup = now
+        cutoff = now - self.task_workspace_ttl_seconds
+        removed: list[str] = []
+        terminal = {"complete", "failed", "cancelled"}
+        for job in self.queue.jobs():
+            if job.status not in terminal:
+                continue
+            try:
+                updated = datetime.fromisoformat(job.updated_at.replace("Z", "+00:00")).timestamp()
+            except (TypeError, ValueError):
+                continue
+            if updated >= cutoff:
+                continue
+            task_dir = self.data_dir / "tasks" / job.id
+            if task_dir.exists():
+                shutil.rmtree(task_dir, ignore_errors=True)
+                removed.append(job.id)
+        return removed
 
     def stop(self) -> None:
         self.stop_event.set()
@@ -1597,6 +1626,8 @@ class ProgressiveController:
     def _worker_loop(self) -> None:
         worker_id = f"local-{os.getpid()}"
         while not self.stop_event.is_set():
+            if time.time() - self.last_task_cleanup >= 24 * 60 * 60:
+                self.cleanup_expired_task_workspaces()
             if self.builder.runtime is None:
                 self.stop_event.wait(5)
                 continue
@@ -1951,13 +1982,15 @@ def sideload(manager: JobManager, request: SideloadRequest) -> dict[str, Any]:
     }
 
 
-def create_app(data_dir: Path = DEFAULT_DATA_DIR, runtime: str = "auto") -> FastAPI:
+def create_app(
+    data_dir: Path = DEFAULT_DATA_DIR, runtime: str = "auto", task_workspace_ttl_days: int = 7
+) -> FastAPI:
     data_dir = data_dir.expanduser().resolve()
     data_dir.mkdir(parents=True, exist_ok=True)
     selected_runtime = detect_runtime(runtime)
     catalog = Catalog(data_dir / "cache" / "enc.geojson")
     manager = JobManager(data_dir, selected_runtime, catalog)
-    progressive = ProgressiveController(data_dir, catalog, manager)
+    progressive = ProgressiveController(data_dir, catalog, manager, task_workspace_ttl_days)
     app = FastAPI(title="Charts Provider Progressive", version=APP_VERSION)
     app.state.manager = manager
     app.state.catalog = catalog
@@ -2343,11 +2376,18 @@ def main() -> int:
     parser.add_argument("--port", type=int, default=8787)
     parser.add_argument("--data-dir", type=Path, default=DEFAULT_DATA_DIR)
     parser.add_argument("--runtime", choices=["auto", "docker", "podman"], default="auto")
+    parser.add_argument("--task-workspace-ttl-days", type=int, default=7)
     parser.add_argument("--self-test", action="store_true")
     args = parser.parse_args()
     if args.self_test:
         return self_test()
-    uvicorn.run(create_app(args.data_dir, args.runtime), host=args.host, port=args.port)
+    if args.task_workspace_ttl_days < 0 or args.task_workspace_ttl_days > 365:
+        parser.error("--task-workspace-ttl-days must be from 0 through 365")
+    uvicorn.run(
+        create_app(args.data_dir, args.runtime, args.task_workspace_ttl_days),
+        host=args.host,
+        port=args.port,
+    )
     return 0
 
 

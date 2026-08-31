@@ -54,7 +54,8 @@ test('configuration is loopback-only and strictly validated', () => {
   assert.deepEqual(bridge.normalizeConfig({}), {
     startLocalBackend: true,
     backendPort: 8787,
-    refreshIntervalSeconds: 3
+    refreshIntervalSeconds: 3,
+    taskWorkspaceTtlDays: 7
   });
   assert.throws(
     () => bridge.normalizeConfig({ backendHost: 'chart-worker.example' }),
@@ -65,6 +66,7 @@ test('configuration is loopback-only and strictly validated', () => {
     () => bridge.normalizeConfig({ refreshIntervalSeconds: '2' }),
     /refreshIntervalSeconds/
   );
+  assert.throws(() => bridge.normalizeConfig({ taskWorkspaceTtlDays: -1 }), /taskWorkspaceTtlDays/);
 });
 
 test('chart descriptors receive immutable generation URLs', () => {

@@ -142,7 +142,7 @@ function pluginConstructor(app) {
   async function initialize(token) {
     let reachable = await backendIsReachable(config.backendPort);
     if (!reachable && config.startLocalBackend && token === lifecycle) {
-      child = spawnLocalBackend(app, config.backendPort, debug, reportError);
+      child = spawnLocalBackend(app, config.backendPort, config.taskWorkspaceTtlDays, debug, reportError);
       reachable = await waitForBackend(config.backendPort, 15_000, () => token !== lifecycle);
     }
 
@@ -245,6 +245,15 @@ function pluginConstructor(app) {
           minimum: 2,
           maximum: 300,
           default: DEFAULT_REFRESH_SECONDS
+        },
+        taskWorkspaceTtlDays: {
+          type: 'integer',
+          title: 'Completed task workspace retention (days)',
+          description:
+            'Keep completed, failed, and cancelled conversion workspaces for this many days. Queue history remains after cleanup. Set 0 to disable automatic cleanup.',
+          minimum: 0,
+          maximum: 365,
+          default: 7
         }
       }
     }),
@@ -423,7 +432,7 @@ function pluginConstructor(app) {
 
 function normalizeConfig(settings) {
   const value = settings && typeof settings === 'object' && !Array.isArray(settings) ? settings : {};
-  const allowed = new Set(['startLocalBackend', 'backendPort', 'refreshIntervalSeconds']);
+  const allowed = new Set(['startLocalBackend', 'backendPort', 'refreshIntervalSeconds', 'taskWorkspaceTtlDays']);
   for (const key of Object.keys(value)) {
     if (!allowed.has(key)) {
       throw new Error(`Unsupported plugin setting: ${key}`);
@@ -438,7 +447,8 @@ function normalizeConfig(settings) {
       2,
       300,
       'refreshIntervalSeconds'
-    )
+    ),
+    taskWorkspaceTtlDays: readInteger(value.taskWorkspaceTtlDays, 7, 0, 365, 'taskWorkspaceTtlDays')
   };
 }
 
@@ -1007,7 +1017,7 @@ function sendJsonError(res, statusCode, message) {
   res.end(body);
 }
 
-function spawnLocalBackend(app, port, debug, reportError) {
+function spawnLocalBackend(app, port, taskWorkspaceTtlDays, debug, reportError) {
   const script = path.join(__dirname, 'chart_baker.py');
   const dataDirectory = path.join(app.getDataDirPath(), 'chart-baker-data');
   debug(`Starting bundled Chart Baker on ${BACKEND_HOST}:${port}`);
@@ -1021,7 +1031,9 @@ function spawnLocalBackend(app, port, debug, reportError) {
       '--port',
       String(port),
       '--data-dir',
-      dataDirectory
+      dataDirectory,
+      '--task-workspace-ttl-days',
+      String(taskWorkspaceTtlDays)
     ],
     {
       cwd: __dirname,
