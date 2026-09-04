@@ -151,6 +151,7 @@ COMPATIBLE_S57_LAYERS = (
     "UWTROC",
     "OBSTRN",
     "FOULGND",
+    "MORFAC",
     "BOYLAT",
     "BCNLAT",
     "BOYCAR",
@@ -176,6 +177,7 @@ BASIC_S57_LAYERS = (
     "WRECKS",
     "UWTROC",
     "OBSTRN",
+    "MORFAC",
     "BOYLAT",
     "BCNLAT",
     "LIGHTS",
@@ -2228,6 +2230,8 @@ $('#refreshJobs').onclick=jobs;async function cancelJob(id){await api(`/api/jobs
 def self_test() -> int:
     assert safe_stem(" NOAA ENC / California ") == "NOAA-ENC-California"
     assert overlaps([-2, -2, 1, 1], [1, 1, 3, 3])
+    assert "MORFAC" in COMPATIBLE_S57_LAYERS
+    assert "MORFAC" in BASIC_S57_LAYERS
     assert not overlaps([-2, -2, 0, 0], [1, 1, 3, 3])
     lon, lat = mercator_coord(-13_358_338.9, 4_430_000)
     assert -121 < lon < -119 and 36 < lat < 38
