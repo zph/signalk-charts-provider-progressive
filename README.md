@@ -146,3 +146,11 @@ Downloads, archive extraction, management proxy responses, and tile responses ha
 Depth display disclaimer: generated vector charts conservatively floor depth values above 40 ft to the nearest whole foot. For example, 40.7 ft is published as 40 ft. This is a display-space policy, not a correction to NOAA source data. Always consult current official chart information and account for datum, tide, vessel draft, squat, and safety margin.
 
 Generated charts are supplemental aids and are not a replacement for official carriage requirements, current source data, prudent seamanship, or independent navigation information.
+
+## ENC detail coverage
+
+The compatible profile includes kelp, seabed composition, moorings and berths, overhead cables
+and pipelines, survey quality, and coverage metadata. Preview packets include kelp and overhead
+hazards; other details arrive with refinement. Resubmit an existing chart set to rebuild it with
+the expanded profile. The selected layer list participates in the generation hash, so previously
+completed narrow-profile work is not reused as an expanded build.

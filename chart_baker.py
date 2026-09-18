@@ -126,6 +126,14 @@ S57_DEPTH_FIELDS = ("DEPTH", "DRVAL1", "DRVAL2", "VALDCO", "VALSOU")
 # layer-selection UI: artifact keys include both the profile and resolved list.
 COMPATIBLE_S57_LAYERS = (
     "M_COVR",
+    "WEDKLP",
+    "SBDARE",
+    "ACHBRT",
+    "BERTHS",
+    "CBLOHD",
+    "PIPOHD",
+    "M_QUAL",
+    "M_SREL",
     "DEPARE",
     "DRGARE",
     "ACHARE",
@@ -168,6 +176,9 @@ COMPATIBLE_S57_LAYERS = (
 )
 
 BASIC_S57_LAYERS = (
+    "WEDKLP",
+    "CBLOHD",
+    "PIPOHD",
     "M_COVR",
     "DEPARE",
     "LNDARE",
@@ -2230,6 +2241,8 @@ $('#refreshJobs').onclick=jobs;async function cancelJob(id){await api(`/api/jobs
 def self_test() -> int:
     assert safe_stem(" NOAA ENC / California ") == "NOAA-ENC-California"
     assert overlaps([-2, -2, 1, 1], [1, 1, 3, 3])
+    assert {"WEDKLP", "SBDARE", "MORFAC", "ACHBRT", "BERTHS", "CBLOHD", "PIPOHD", "M_QUAL", "M_SREL"} <= set(COMPATIBLE_S57_LAYERS)
+    assert set(BASIC_S57_LAYERS) <= set(COMPATIBLE_S57_LAYERS)
     assert "MORFAC" in COMPATIBLE_S57_LAYERS
     assert "MORFAC" in BASIC_S57_LAYERS
     assert not overlaps([-2, -2, 0, 0], [1, 1, 3, 3])
